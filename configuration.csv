@@ -1,0 +1,2 @@
+risk_per_trade,leverage,atr_value,lookback_candles,swing_window,starting_balance
+3.0,20,14,100,5,100
