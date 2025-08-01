@@ -17,6 +17,7 @@ import matplotlib.patches as mpatches
 import io
 import threading
 import requests
+import logging
 try:
     import mplfinance as mpf
 except ImportError:
@@ -203,20 +204,29 @@ def get_fib_retracement(p1, p2, trend):
 
 def calculate_quantity(client, symbol, risk_per_trade, sl_price, entry_price, leverage):
     """
-    Calculate the order quantity based on risk.
+    Calculate the order quantity based on risk and leverage.
     """
     try:
         # Get account balance
         account_info = client.futures_account()
         balance = float(account_info['totalWalletBalance'])
         
-        # Calculate position size
+        # Calculate the maximum position size allowed by leverage
+        max_position_size = balance * leverage
+        
+        # Calculate the desired position size based on risk
         risk_amount = balance * (risk_per_trade / 100)
         sl_percentage = abs(entry_price - sl_price) / entry_price
-        position_size = risk_amount / sl_percentage
+        if sl_percentage == 0:
+            return 0
+        
+        trade_position_size = risk_amount / sl_percentage
+        
+        # Use the smaller of the two position sizes
+        final_position_size = min(trade_position_size, max_position_size)
         
         # Calculate quantity
-        quantity = (position_size * leverage) / entry_price
+        quantity = final_position_size / entry_price
         
         # Adjust for symbol's precision
         info = client.get_symbol_info(symbol)
@@ -767,6 +777,16 @@ async def place_real_order(client, symbol, side, quantity, bot, live_mode=False)
         except Exception as telegram_e:
             print(f"Error sending Telegram message: {telegram_e}")
         return {"status": "error", "message": str(e)}
+
+async def send_telegram_alert(bot, message):
+    """A simple helper function to send a Telegram message."""
+    if not bot:
+        logging.warning(f"Telegram bot not available. Message not sent: {message}")
+        return
+    try:
+        await bot.send_message(chat_id=keys.telegram_chat_id, text=message)
+    except Exception as e:
+        logging.error(f"Failed to send Telegram alert: {e}")
 
 async def send_start_message(bot, backtest_mode=False):
     if backtest_mode:
