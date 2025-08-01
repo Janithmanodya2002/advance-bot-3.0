@@ -18,12 +18,27 @@ import io
 import threading
 import requests
 import logging
+from binance.exceptions import BinanceAPIException
 try:
     import mplfinance as mpf
 except ImportError:
     print("mplfinance not found. Please install it by running: pip install mplfinance")
     exit()
 from tabulate import tabulate
+
+def is_session_valid(client):
+    """
+    Check if the current Binance session is valid.
+    """
+    try:
+        client.futures_account()
+        return True
+    except BinanceAPIException as e:
+        print(f"Session check failed: {e}")
+        return False
+    except Exception as e:
+        print(f"An unexpected error occurred during session check: {e}")
+        return False
 
 class TradeResult:
     def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels):
@@ -281,8 +296,6 @@ def get_atr(klines, period=14):
         
     return atr
 
-
-from binance.exceptions import BinanceAPIException
 
 def get_klines(client, symbol, interval='15m', limit=100, start_str=None, end_str=None):
     """
@@ -1306,6 +1319,22 @@ async def main():
         print("Entering main loop...")
         last_session = None
         while True:
+            if not is_session_valid(client):
+                print("Session is not valid. Halting new scans and cancelling pending orders.")
+                with trades_lock:
+                    pending_trades = [t for t in trades if t['status'] == 'pending']
+                    for trade in pending_trades:
+                        print(f"Cancelling pending trade for {trade['symbol']} due to invalid session.")
+                        trade['status'] = 'cancelled_session_invalid'
+                        if trade['symbol'] in virtual_orders:
+                            del virtual_orders[trade['symbol']]
+                    update_trade_report(trades)
+                
+                await send_telegram_alert(bot, "⚠️ Binance session is invalid. Bot is pausing new trade scans but will continue to monitor open positions.")
+                print("Sleeping for 60 seconds before re-checking session.")
+                await asyncio.sleep(60)
+                continue
+
             print("Starting new scan cycle...")
 
             # Session Filtering
