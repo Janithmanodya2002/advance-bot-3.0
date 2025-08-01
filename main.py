@@ -20,6 +20,8 @@ import requests
 import logging
 from binance.exceptions import BinanceAPIException
 import ML
+import joblib
+
 try:
     import mplfinance as mpf
 except ImportError:
@@ -1130,13 +1132,35 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
         await asyncio.sleep(5)
 
 
-# Global variables for trades
+# Global variables
 virtual_orders = {}
 trades = []
 leverage = 0
 chart_image_candles = 0
 trades_lock = threading.Lock()
 rejected_symbols = {}
+ml_model = None
+ml_feature_columns = None
+model_confidence_threshold = 0.7 # Default value
+
+def get_model_prediction(klines, setup_info, model, feature_columns):
+    """
+    Generates features for a live setup and gets a prediction from the ML model.
+    """
+    # Convert klines to a DataFrame for the feature generation function
+    klines_df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        klines_df[col] = pd.to_numeric(klines_df[col], errors='coerce')
+
+    # Generate the feature vector
+    feature_vector = ML.generate_features_for_live_setup(klines_df, setup_info, feature_columns)
+    
+    # Make prediction
+    prediction = model.predict(feature_vector)[0]
+    probabilities = model.predict_proba(feature_vector)[0]
+    confidence = probabilities[prediction]
+    
+    return prediction, confidence
 
 async def main():
     """
@@ -1154,7 +1178,7 @@ async def main():
     bot = telegram.Bot(token=keys.telegram_bot_token)
 
     # Load configuration
-    global leverage, chart_image_candles
+    global leverage, chart_image_candles, ml_model, ml_feature_columns, model_confidence_threshold
     try:
         config_df = pd.read_csv('configuration.csv').iloc[0]
         config = config_df.to_dict()
@@ -1168,6 +1192,7 @@ async def main():
         starting_balance = int(config['starting_balance'])
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
+        model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1175,6 +1200,19 @@ async def main():
     except Exception as e:
         print(f"Error loading configuration: {e}")
         return
+
+    # Load the ML model
+    try:
+        model_data = joblib.load('models/trading_model.joblib')
+        ml_model = model_data['model']
+        ml_feature_columns = model_data['feature_columns']
+        print(f"ML model loaded. Signal confidence threshold is {model_confidence_threshold * 100}%.")
+    except FileNotFoundError:
+        print("ML model not found. The bot will run in signal-only mode without ML filtering.")
+        ml_model = None # Ensure it's None if loading fails
+    except Exception as e:
+        print(f"Error loading ML model: {e}. The bot will run in signal-only mode.")
+        ml_model = None
 
     # Load symbols
     try:
@@ -1362,14 +1400,38 @@ async def main():
                         tp1 = entry_price - (sl - entry_price)
                         tp2 = entry_price - (sl - entry_price) * 2
 
+                        # --- ML Model Integration ---
+                        if ml_model:
+                            setup_info = {
+                                'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
+                                'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
+                            }
+                            prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
+                            
+                            print(f"ML Model Prediction for {symbol} Short: Class {prediction} with {confidence:.2f}% confidence.")
+
+                            if prediction == 0 or confidence < model_confidence_threshold:
+                                print(f"  - ML Model REJECTED signal. Reason: Prediction={prediction}, Confidence={confidence:.2f}")
+                                rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spam
+                                continue # Skip to next symbol
+                            
+                            print("  - ML Model ACCEPTED signal.")
+                        # --------------------------
+
                         symbol_info = symbols_info[symbol]
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
 
+                        prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
+                        ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
+                        
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}"
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, backtest_mode)
+                        caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
+                                   f"Symbol: {symbol}\nSide: Short\nLeverage: {leverage}x\n"
+                                   f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
+                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
+                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
                         with trades_lock:
@@ -1390,14 +1452,38 @@ async def main():
                         tp1 = entry_price + (entry_price - last_swing_low)
                         tp2 = entry_price + (entry_price - last_swing_low) * 2
 
+                        # --- ML Model Integration ---
+                        if ml_model:
+                            setup_info = {
+                                'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
+                                'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
+                            }
+                            prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
+                            
+                            print(f"ML Model Prediction for {symbol} Long: Class {prediction} with {confidence:.2f}% confidence.")
+
+                            if prediction == 0 or confidence < model_confidence_threshold:
+                                print(f"  - ML Model REJECTED signal. Reason: Prediction={prediction}, Confidence={confidence:.2f}")
+                                rejected_symbols[symbol] = time.time()
+                                continue
+                            
+                            print("  - ML Model ACCEPTED signal.")
+                        # --------------------------
+
                         symbol_info = symbols_info[symbol]
                         quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
 
+                        prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
+                        ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
+
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}"
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, backtest_mode)
+                        caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
+                                   f"Symbol: {symbol}\nSide: Long\nLeverage: {leverage}x\n"
+                                   f"Risk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\n"
+                                   f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
+                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
                         new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
                         with trades_lock:
