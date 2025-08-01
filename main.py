@@ -856,7 +856,7 @@ async def op_command(update, context):
 
     for trade in open_trades:
         symbol = trade['symbol']
-        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
         if klines:
             swing_highs, swing_lows = get_swing_points(klines, 5)
             if not swing_highs or not swing_lows:
@@ -918,7 +918,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                             if (trade['side'] == 'long' and price <= trade['sl']) or \
                                (trade['side'] == 'short' and price >= trade['sl']):
                                 try:
-                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
                                     if klines_for_chart:
                                         image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
                                         caption = f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}"
@@ -954,7 +954,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                 trade['quantity'] *= 0.5
                                 update_trade_report(trades)
                                 try:
-                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
                                     if klines_for_chart:
                                         image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
                                         caption = f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 50% of the position.\nNew SL: {trade['sl']:.8f}"
@@ -971,7 +971,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                 trade['quantity'] *= 0.6
                                 update_trade_report(trades)
                                 try:
-                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
                                     if klines_for_chart:
                                         image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
                                         caption = f"🎉 TAKE PROFIT 2 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 40% of the position.\nNew SL: {trade['sl']:.8f}"
@@ -1006,6 +1006,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
 virtual_orders = {}
 trades = []
 leverage = 0
+chart_image_candles = 0
 trades_lock = threading.Lock()
 rejected_symbols = {}
 
@@ -1028,7 +1029,7 @@ async def main():
     await send_start_message(bot, backtest_mode)
 
     # Load configuration
-    global leverage
+    global leverage, chart_image_candles
     try:
         config = pd.read_csv('configuration.csv').iloc[0]
         risk_per_trade = config['risk_per_trade']
@@ -1037,6 +1038,7 @@ async def main():
         lookback_candles = int(config['lookback_candles'])
         swing_window = int(config['swing_window'])
         starting_balance = int(config['starting_balance'])
+        chart_image_candles = int(config['chart_image_candles'])
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
