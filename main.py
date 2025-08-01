@@ -124,6 +124,17 @@ def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price
     
     return buf
 
+def get_binance_server_time(client):
+    """
+    Get the current server time from Binance.
+    """
+    try:
+        server_time = client.get_server_time()
+        return server_time['serverTime']
+    except Exception as e:
+        print(f"Error getting Binance server time: {e}")
+        return None
+
 def get_public_ip():
     """
     Get the public IP address.
@@ -202,7 +213,7 @@ def get_fib_retracement(p1, p2, trend):
     
     return entry_price
 
-def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage):
+def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False):
     """
     Calculate the order quantity based on risk and leverage.
     """
@@ -215,7 +226,11 @@ def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_pric
         max_position_size = balance * leverage
         
         # Calculate the desired position size based on risk
-        risk_amount = balance * (risk_per_trade / 100)
+        risk_amount = 0
+        if use_fixed_risk_amount:
+            risk_amount = risk_amount_usd
+        else:
+            risk_amount = balance * (risk_per_trade / 100)
         sl_percentage = abs(entry_price - sl_price) / entry_price
         if sl_percentage == 0:
             return 0
@@ -825,11 +840,16 @@ async def send_telegram_alert(bot, message):
     except Exception as e:
         logging.error(f"Failed to send Telegram alert: {e}")
 
-async def send_start_message(bot, backtest_mode=False):
+async def send_start_message(bot, backtest_mode=False, current_session=None):
     if backtest_mode:
         return
     try:
-        await bot.send_message(chat_id=keys.telegram_chat_id, text="🤖 Bot started!")
+        message = "🤖 Bot started!"
+        if current_session:
+            message += f"\n📈 Current Session: {current_session}"
+        else:
+            message += "\n😴 Outside of all trading sessions."
+        await bot.send_message(chat_id=keys.telegram_chat_id, text=message)
     except Exception as e:
         print(f"Error sending start message: {e}")
 
@@ -907,146 +927,189 @@ async def op_command(update, context):
             caption = f"Open Trade: {symbol}\nSide: {trade['side']}\nEntry: {trade['entry_price']:.8f}\nCurrent Price: {current_price:.8f}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}"
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_buffer, caption=caption)
 
+async def cancel_order(client, symbol, order_id):
+    """Cancel an open order."""
+    if order_id is None:
+        return True, None
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: client.futures_cancel_order(symbol=symbol, orderId=order_id))
+        print(f"Order CANCELED: {symbol} ID {order_id}")
+        return True, None
+    except BinanceAPIException as e:
+        if e.code == -2011:
+            print(f"Order {order_id} for {symbol} not found to cancel. It might have been filled or already cancelled.")
+            return True, None
+        error_msg = f"Failed to cancel order {order_id} for {symbol}: {str(e)}"
+        print(error_msg)
+        return False, str(e)
+    except Exception as e:
+        error_msg = f"Unexpected error canceling order {order_id} for {symbol}: {str(e)}"
+        print(error_msg)
+        return False, str(e)
+
 async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False):
     """
-    Continuously monitor the status of open and pending trades.
+    Continuously monitor the status of open and pending trades using order status polling.
     """
     if backtest_mode:
         return
     print("Order status monitor started.")
     bot = application.bot
+    loop = asyncio.get_running_loop()
+
     while True:
         try:
+            active_trades = []
             with trades_lock:
-                if not trades:
-                    await asyncio.sleep(1)
-                    continue
+                active_trades = [t for t in trades if t['status'] in ['pending', 'running']]
 
-                print(f"Monitor: Checking {len(trades)} trades.")
-                for trade in trades:
-                    if trade['status'] not in ['pending', 'running', 'tp1_hit', 'tp2_hit']:
-                        continue
+            if not active_trades:
+                await asyncio.sleep(5)
+                continue
 
-                    symbol = trade['symbol']
-                    print(f"Monitor: Checking {symbol}.")
-                    # Fetch the last 5 seconds of k-line data
-                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_1SECOND, limit=5)
-                    if not klines:
-                        continue
-
-                    # Check for expired orders
+            print(f"Monitor: Checking {len(active_trades)} active trades.")
+            for trade in active_trades:
+                symbol = trade['symbol']
+                symbol_info = symbols_info[symbol]
+                pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT' if is_hedge_mode else None
+                
+                if trade['status'] == 'pending':
                     if time.time() * 1000 - trade['timestamp'] > 4 * 60 * 60 * 1000:
-                        if trade['status'] == 'pending':
-                            try:
-                                await bot.send_message(chat_id=keys.telegram_chat_id, text=f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
-                            except Exception as e:
-                                print(f"Error sending Telegram message: {e}")
-                            trade['status'] = 'rejected'
-                            update_trade_report(trades)
-                            if symbol in virtual_orders:
-                                del virtual_orders[symbol]
+                        await send_telegram_alert(bot, f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
+                        trade['status'] = 'rejected'
+                        if symbol in virtual_orders: del virtual_orders[symbol]
                         continue
-
-                    prices = [float(k[4]) for k in klines]
-
-                    for price in prices:
-                        # Check for SL/TP hits
-                        if trade['status'] in ['running', 'tp1_hit', 'tp2_hit']:
-                            if (trade['side'] == 'long' and price <= trade['sl']) or \
-                               (trade['side'] == 'short' and price >= trade['sl']):
+                    
+                    current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
+                    if (trade['side'] == 'long' and current_price >= trade['entry_price']) or \
+                       (trade['side'] == 'short' and current_price <= trade['entry_price']):
+                        
+                        if live_mode:
+                            order, err = await place_new_order(client, symbol_info, 'BUY' if trade['side'] == 'long' else 'SELL', 'MARKET', trade['quantity'], position_side=pos_side)
+                            if err:
+                                await send_telegram_alert(bot, f"⚠️ MARKET ORDER FAILED for {symbol}: {err}")
+                                trade['status'] = 'rejected'
+                                if symbol in virtual_orders: del virtual_orders[symbol]
+                                continue
+                            
+                            entry_order_id = order['orderId']
+                            start_time = time.time()
+                            filled = False
+                            while time.time() - start_time < 10: # 10 second timeout
                                 try:
-                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
-                                    if klines_for_chart:
-                                        image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
-                                        caption = f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}"
-                                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
-                                    else:
-                                        await bot.send_message(chat_id=keys.telegram_chat_id, text=f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}")
-                                except Exception as e:
-                                    print(f"Error sending Telegram message: {e}")
-                                trade['status'] = 'sl_hit'
-                                rejected_symbols[symbol] = time.time()
-                                update_trade_report(trades)
-                                if symbol in virtual_orders:
-                                    del virtual_orders[symbol]
-                                break
-
-                            if trade['status'] == 'running':
-                                if (trade['side'] == 'long' and price >= trade['entry_price'] * 1.005) or \
-                                   (trade['side'] == 'short' and price <= trade['entry_price'] * 0.995):
-                                    new_sl = trade['entry_price'] * 1.001 if trade['side'] == 'long' else trade['entry_price'] * 0.999
-                                    if (trade['side'] == 'long' and new_sl > trade['sl']) or \
-                                       (trade['side'] == 'short' and new_sl < trade['sl']):
-                                        trade['sl'] = new_sl
-                                        update_trade_report(trades)
-                                        try:
-                                            await bot.send_message(chat_id=keys.telegram_chat_id, text=f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {trade['sl']:.8f}")
-                                        except Exception as e:
-                                            print(f"Error sending Telegram message: {e}")
-
-                            if trade['status'] == 'running' and ((trade['side'] == 'long' and price >= trade['tp1']) or \
-                               (trade['side'] == 'short' and price <= trade['tp1'])):
-                                trade['status'] = 'tp1_hit'
-                                trade['sl'] = trade['entry_price']
-                                trade['quantity'] *= 0.5
-                                update_trade_report(trades)
-                                try:
-                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
-                                    if klines_for_chart:
-                                        image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
-                                        caption = f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 50% of the position.\nNew SL: {trade['sl']:.8f}"
-                                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
-                                    else:
-                                        await bot.send_message(chat_id=keys.telegram_chat_id, text=f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 50% of the position.\nNew SL: {trade['sl']:.8f}")
-                                except Exception as e:
-                                    print(f"Error sending Telegram message: {e}")
-
-                            if trade['status'] == 'tp1_hit' and ((trade['side'] == 'long' and price >= trade['tp2']) or \
-                               (trade['side'] == 'short' and price <= trade['tp2'])):
-                                trade['status'] = 'tp2_hit'
-                                trade['sl'] = trade['tp1']
-                                trade['quantity'] *= 0.6
-                                update_trade_report(trades)
-                                try:
-                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=chart_image_candles)
-                                    if klines_for_chart:
-                                        image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
-                                        caption = f"🎉 TAKE PROFIT 2 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 40% of the position.\nNew SL: {trade['sl']:.8f}"
-                                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
-                                    else:
-                                        await bot.send_message(chat_id=keys.telegram_chat_id, text=f"🎉 TAKE PROFIT 2 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 40% of the position.\nNew SL: {trade['sl']:.8f}")
-                                except Exception as e:
-                                    print(f"Error sending Telegram message: {e}")
-
-                        # Check for triggered orders
-                        elif trade['status'] == 'pending':
-                            if (trade['side'] == 'long' and price >= trade['entry_price']) or \
-                               (trade['side'] == 'short' and price <= trade['entry_price']):
-                                
-                                if live_mode:
-                                    symbol_info = symbols_info[symbol]
-                                    pos_side = None
-                                    if is_hedge_mode:
-                                        pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT'
-                                    
-                                    order, err = await place_new_order(client, symbol_info, 'BUY' if trade['side'] == 'long' else 'SELL', 'MARKET', trade['quantity'], position_side=pos_side)
-                                    if err:
-                                        await send_telegram_alert(bot, f"⚠️ ORDER FAILED for {symbol}: {err}")
-                                        trade['status'] = 'rejected'
-                                        if symbol in virtual_orders: del virtual_orders[symbol]
+                                    entry_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=entry_order_id))
+                                    if entry_order['status'] == 'FILLED':
+                                        order = entry_order
+                                        filled = True
                                         break
-                                
-                                trade['status'] = 'running'
-                                update_trade_report(trades)
-                                try:
-                                    await bot.send_message(chat_id=keys.telegram_chat_id, text=f"✅ TRADE TRIGGERED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nTP1: {trade['tp1']:.8f}\nTP2: {trade['tp2']:.8f}\nTP3: {trade['tp3']:.8f}\nSL: {trade['sl']:.8f}\nLeverage: {leverage}x")
                                 except Exception as e:
-                                    print(f"Error sending Telegram message: {e}")
-                                break
+                                    await send_telegram_alert(bot, f"Warning: Could not check entry order status for {symbol}. Error: {e}")
+                                await asyncio.sleep(0.5)
+                            
+                            if not filled:
+                                await send_telegram_alert(bot, f"CRITICAL: Market entry order for {symbol} was not filled in time. Cancelling trade.")
+                                await cancel_order(client, symbol, entry_order_id)
+                                trade['status'] = 'rejected'
+                                if symbol in virtual_orders: del virtual_orders[symbol]
+                                continue
+
+                            trade['entry_price'] = float(order['avgPrice'])
+                            sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+
+                            sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=trade['sl'], is_closing_order=True, position_side=pos_side)
+                            if sl_err:
+                                await send_telegram_alert(bot, f"CRITICAL: Failed to place SL for {symbol}. Closing position.")
+                                await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', trade['quantity'], is_closing_order=True, position_side=pos_side)
+                                trade['status'] = 'error'
+                                if symbol in virtual_orders: del virtual_orders[symbol]
+                                continue
+                            trade['sl_order_id'] = sl_order['orderId']
+
+                            step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                            
+                            qty_tp1 = (trade['quantity'] * 0.5 // step_size) * step_size if step_size else 0
+                            qty_tp2 = trade['quantity'] - qty_tp1
+
+                            if qty_tp1 > 0:
+                                tp_order, tp_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', qty_tp1, stop_price=trade['tp1'], is_closing_order=True, position_side=pos_side)
+                                if not tp_err:
+                                    trade['tp_order_id'] = tp_order['orderId']
+                                else:
+                                    await send_telegram_alert(bot, f"Warning: Failed to place TP1 for {symbol}. SL is active. Error: {tp_err}")
+                            
+                            if qty_tp2 > 0:
+                                tp2_order, tp2_err = await place_new_order(client, symbol_info, sl_tp_side, 'TAKE_PROFIT_MARKET', qty_tp2, stop_price=trade['tp2'], is_closing_order=True, position_side=pos_side)
+                                if tp2_err:
+                                    await send_telegram_alert(bot, f"Warning: Failed to place TP2 for {symbol}. Error: {tp2_err}")
+                        
+                        trade['status'] = 'running'
+                        await send_telegram_alert(bot, f"✅ TRADE TRIGGERED & PROTECTED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}")
+
+                elif trade['status'] == 'running':
+                    sl_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['sl_order_id']))
+                    if sl_order['status'] == 'FILLED':
+                        await send_telegram_alert(bot, f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {sl_order['avgPrice']}")
+                        await cancel_order(client, symbol, trade['tp_order_id'])
+                        trade['status'] = 'sl_hit'
+                        if symbol in virtual_orders: del virtual_orders[symbol]
+                        continue
+                    
+                    if trade['tp_order_id']:
+                        tp_order = await loop.run_in_executor(None, lambda: client.futures_get_order(symbol=symbol, orderId=trade['tp_order_id']))
+                        if tp_order['status'] == 'FILLED':
+                            await send_telegram_alert(bot, f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {tp_order['avgPrice']}\nClosing 50% of the position.")
+                            await cancel_order(client, symbol, trade['sl_order_id'])
+                            
+                            trade['status'] = 'tp1_hit'
+                            trade['sl'] = trade['entry_price']
+                            
+                            step_size = next((float(f['stepSize']) for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+                            remaining_quantity = (trade['quantity'] * 0.5 // step_size) * step_size if step_size else 0
+                            trade['quantity'] = remaining_quantity
+
+                            if live_mode and remaining_quantity > 0:
+                                sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                                
+                                new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', remaining_quantity, stop_price=trade['sl'], reduce_only=True, position_side=pos_side)
+                                if sl_err:
+                                    await send_telegram_alert(bot, f"CRITICAL: Failed to place new SL for {symbol} after TP1. Closing position.")
+                                    await place_new_order(client, symbol_info, sl_tp_side, 'MARKET', remaining_quantity, reduce_only=True, position_side=pos_side)
+                                    trade['status'] = 'error'
+                                    if symbol in virtual_orders: del virtual_orders[symbol]
+                                    continue
+                                trade['sl_order_id'] = new_sl_order['orderId']
+                                
+                                # Placeholder for TP2 logic
+                                trade['tp_order_id'] = None 
+                            continue
+
+                    current_price = float((await loop.run_in_executor(None, lambda: client.get_symbol_ticker(symbol=symbol)))['price'])
+                    if (trade['side'] == 'long' and current_price >= trade['entry_price'] * 1.20) or \
+                       (trade['side'] == 'short' and current_price <= trade['entry_price'] * 0.80):
+                        new_sl = trade['entry_price']
+                        if (trade['side'] == 'long' and new_sl > trade['sl']) or \
+                           (trade['side'] == 'short' and new_sl < trade['sl']):
+                            
+                            if live_mode:
+                                sl_tp_side = 'SELL' if trade['side'] == 'long' else 'BUY'
+                                ok, err = await cancel_order(client, symbol, trade['sl_order_id'])
+                                if ok:
+                                    new_sl_order, sl_err = await place_new_order(client, symbol_info, sl_tp_side, 'STOP_MARKET', trade['quantity'], stop_price=new_sl, reduce_only=True, position_side=pos_side)
+                                    if not sl_err:
+                                        trade['sl'] = new_sl
+                                        trade['sl_order_id'] = new_sl_order['orderId']
+                                        await send_telegram_alert(bot, f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {new_sl:.8f}")
+                                    else:
+                                        await send_telegram_alert(bot, f"Warning: Failed to update SL for {symbol}. Original SL may be active or filled.")
+            
+            with trades_lock:
+                update_trade_report(trades)
+
         except Exception as e:
             print(f"Error in order status monitor: {e}")
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)
 
 
 # Global variables for trades
@@ -1072,20 +1135,21 @@ async def main():
         print("Could not determine public IP address.")
     
     bot = telegram.Bot(token=keys.telegram_bot_token)
-    # Send start message
-    await send_start_message(bot, backtest_mode)
-
+    
     # Load configuration
     global leverage, chart_image_candles
     try:
         config = pd.read_csv('configuration.csv').iloc[0]
         risk_per_trade = config['risk_per_trade']
+        risk_amount_usd = config['risk_amount_usd']
+        use_fixed_risk_amount = config['use_fixed_risk_amount']
         leverage = config['leverage']
         atr_value = int(config['atr_value'])
         lookback_candles = int(config['lookback_candles'])
         swing_window = int(config['swing_window'])
         starting_balance = int(config['starting_balance'])
         chart_image_candles = int(config['chart_image_candles'])
+        max_open_positions = int(config['max_open_positions'])
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1109,6 +1173,19 @@ async def main():
     try:
         client = Client(keys.api_mainnet, keys.secret_mainnet)
         print("Binance client initialized.")
+        
+        # Send start message
+        server_time = get_binance_server_time(client)
+        current_session = None
+        if server_time:
+            current_hour = datetime.datetime.fromtimestamp(server_time / 1000, tz=pytz.utc).hour
+            if 0 <= current_hour < 9:
+                current_session = "Asia"
+            elif 7 <= current_hour < 16:
+                current_session = "London"
+            elif 12 <= current_hour < 21:
+                current_session = "New York"
+        await send_start_message(bot, backtest_mode, current_session)
 
         # Fetch exchange info and position mode
         exchange_info = client.futures_exchange_info()
@@ -1227,8 +1304,36 @@ async def main():
     else:
         # Main scanning loop
         print("Entering main loop...")
+        last_session = None
         while True:
             print("Starting new scan cycle...")
+
+            # Session Filtering
+            server_time = get_binance_server_time(client)
+            current_hour = -1
+            if server_time:
+                current_hour = datetime.datetime.fromtimestamp(server_time / 1000, tz=pytz.utc).hour
+            
+            active_session = None
+            if 0 <= current_hour < 9:
+                active_session = "Asia"
+            elif 7 <= current_hour < 16:
+                active_session = "London"
+            elif 12 <= current_hour < 21:
+                active_session = "New York"
+
+            if active_session:
+                if active_session != last_session:
+                    await send_telegram_alert(bot, f"📈 New Session Started: {active_session}")
+                    last_session = active_session
+            else:
+                if last_session is not None:
+                    await send_telegram_alert(bot, "😴 Outside of all trading sessions. Bot is sleeping.")
+                last_session = None
+                print(f"Outside of trading session. Current UTC hour: {current_hour}. Sleeping...")
+                await asyncio.sleep(60)
+                continue
+
             for symbol in symbols:
                 try:
                     # Check for rejected symbols cooldown
@@ -1238,6 +1343,12 @@ async def main():
                     # Check if there is already an open or pending trade for this symbol
                     if symbol in virtual_orders:
                         continue
+
+                    # Check if the maximum number of open positions has been reached
+                    with trades_lock:
+                        open_trades = [t for t in trades if t['status'] in ['running', 'tp1_hit', 'tp2_hit', 'pending']]
+                        if len(open_trades) >= max_open_positions:
+                            continue
 
                     print(f"Scanning {symbol}...")
                     klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
@@ -1261,18 +1372,17 @@ async def main():
                         sl = last_swing_high
                         tp1 = entry_price - (sl - entry_price)
                         tp2 = entry_price - (sl - entry_price) * 2
-                        tp3 = 0 # Floating TP
                         
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage)
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
                         
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
+                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}"
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption, backtest_mode)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0]}
+                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
@@ -1290,18 +1400,17 @@ async def main():
                         sl = last_swing_low
                         tp1 = entry_price + (entry_price - last_swing_low)
                         tp2 = entry_price + (entry_price - last_swing_low) * 2
-                        tp3 = 0 # Floating TP
 
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage)
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
 
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
+                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}"
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption, backtest_mode)
 
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0]}
+                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
