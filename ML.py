@@ -377,6 +377,31 @@ def calculate_macd(df, fast_period=12, slow_period=26, signal_period=9):
     signal = macd.ewm(span=signal_period, adjust=False).mean()
     return macd, signal
 
+def calculate_adx(df, period=14):
+    """Calculates the Average Directional Index (ADX)."""
+    df['high_diff'] = df['high'].diff()
+    df['low_diff'] = df['low'].diff()
+    df['plus_dm'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
+    df['minus_dm'] = np.where((df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0), df['low_diff'], 0)
+
+    # ATR is needed for ADX calculation
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, adjust=False).mean()
+
+    plus_di = 100 * (df['plus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr)
+    minus_di = 100 * (df['minus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr)
+
+    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+
+    # Clean up temporary columns
+    df.drop(['high_diff', 'low_diff', 'plus_dm', 'minus_dm'], axis=1, inplace=True)
+    
+    return adx.fillna(0) # Return ADX, fill initial NaNs with 0
+
 def engineer_features():
     """Loads labeled trades and engineers features for the ML model."""
     print("Starting feature engineering...")
@@ -396,10 +421,25 @@ def engineer_features():
             df['atr'] = calculate_atr(df)
             df['rsi'] = calculate_rsi(df)
             df['macd'], df['macd_signal'] = calculate_macd(df)
-            df['rolling_volatility'] = df['close'].pct_change().rolling(window=20).std()
+            df['adx'] = calculate_adx(df) # New trend strength feature
+            
+            # New multi-period volatility features
+            for p in [20, 50, 100]:
+                df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
+            
             df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
-            df.set_index('timestamp', inplace=True)
-            all_raw_data[symbol] = df
+            
+            # Create a datetime index for resampling
+            df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
+
+            # Higher-timeframe features (4-hour)
+            df_4h = df['close'].resample('4h').ohlc()
+            df_4h['rsi'] = calculate_rsi(df_4h)
+            df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
+            df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
+            
+            # Store both original and 4h data
+            all_raw_data[symbol] = {'15m': df, '4h': df_4h}
 
     feature_list = []
     for _, row in labeled_df.iterrows():
@@ -408,11 +448,21 @@ def engineer_features():
 
         if symbol not in all_raw_data:
             continue
+        
+        data_dict = all_raw_data[symbol]
+        raw_df_15m = data_dict['15m']
+        raw_df_4h = data_dict['4h']
 
-        raw_df = all_raw_data[symbol]
+        # The index is now datetime
+        setup_timestamp_dt = pd.to_datetime(timestamp, unit='ms')
+
         try:
             # Find the exact setup candle in the raw data
-            setup_candle = raw_df.loc[timestamp]
+            setup_candle = raw_df_15m.loc[setup_timestamp_dt]
+            # Find the corresponding 4h candle
+            # Use asof to get the last available 4h data for the given 15m candle time
+            htf_candle = raw_df_4h.asof(setup_timestamp_dt)
+
         except KeyError:
             # This can happen if the labeled setup is too close to the edge of the raw data
             continue
@@ -447,6 +497,11 @@ def engineer_features():
             features['tp1_pct'] = np.nan
             features['tp2_pct'] = np.nan
 
+        # Price Action Feature
+        candle_range = setup_candle['high'] - setup_candle['low']
+        candle_body = abs(setup_candle['open'] - setup_candle['close'])
+        features['body_to_range_ratio'] = candle_body / candle_range if candle_range > 0 else 0
+
         # Session One-Hot Encoding
         session_str = setup_candle['session']
         features['is_asia'] = 1 if 'Asia' in session_str else 0
@@ -457,8 +512,14 @@ def engineer_features():
         features['atr'] = setup_candle['atr']
         features['rsi'] = setup_candle['rsi']
         features['macd_diff'] = setup_candle['macd'] - setup_candle['macd_signal']
-        features['rolling_volatility'] = setup_candle['rolling_volatility']
+        features['adx'] = setup_candle['adx']
+        for p in [20, 50, 100]:
+            features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
         
+        # Higher-Timeframe Context
+        features['rsi_4h'] = htf_candle['rsi']
+        features['macd_diff_4h'] = htf_candle['macd_diff']
+
         # Symbol-Level Features
         features['liquidity_proxy'] = setup_candle['liquidity_proxy']
 
@@ -555,7 +616,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
 
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
 # --- Model Training (Step 4) ---
 def train_model():
@@ -573,10 +634,15 @@ def train_model():
 
     # --- Data Preparation ---
     feature_columns = [
+        # Original Features
         'golden_zone_ratio', 'sl_pct', 'tp1_pct', 'tp2_pct',
         'is_asia', 'is_london', 'is_new_york',
-        'atr', 'rsi', 'macd_diff', 'rolling_volatility',
-        'liquidity_proxy'
+        'atr', 'rsi', 'macd_diff', 'liquidity_proxy',
+        # New Features
+        'body_to_range_ratio',
+        'adx',
+        'volatility_20', 'volatility_50', 'volatility_100',
+        'rsi_4h', 'macd_diff_4h'
     ]
     features_df['side_long'] = (features_df['side'] == 'long').astype(int)
     feature_columns.append('side_long')
@@ -601,13 +667,14 @@ def train_model():
     sample_weights = y_train.map(weights_dict)
 
     # --- Hyperparameter Tuning with GridSearchCV ---
-    # Define the parameter grid to search
-    # This is a small grid for demonstration; a real search would be larger.
+    # Define an expanded parameter grid to search.
     param_grid = {
-        'max_depth': [3, 5, 7],
-        'learning_rate': [0.01, 0.1],
-        'n_estimators': [100, 200],
-        'subsample': [0.7, 0.8],
+        'max_depth': [3, 5, 7, 9],
+        'learning_rate': [0.01, 0.05, 0.1],
+        'n_estimators': [100, 200, 300],
+        'subsample': [0.7, 0.8, 0.9],
+        'colsample_bytree': [0.7, 0.8, 0.9], # Feature subsampling
+        'gamma': [0, 0.1, 0.2] # Regularization
     }
 
     # Initialize XGBoost Classifier
@@ -621,13 +688,13 @@ def train_model():
     )
 
     # Initialize GridSearchCV
-    # cv=3 uses 3-fold cross-validation. TimeSeriesSplit is better for time-series data.
-    # We use n_jobs=-1 here as well to parallelize the grid search process.
+    # Use TimeSeriesSplit for cross-validation to respect the chronological order of data
+    tscv = TimeSeriesSplit(n_splits=3)
     grid_search = GridSearchCV(
-        estimator=model, 
-        param_grid=param_grid, 
-        scoring='f1_weighted', 
-        cv=3, 
+        estimator=model,
+        param_grid=param_grid,
+        scoring='f1_weighted',
+        cv=tscv,
         verbose=1,
         n_jobs=-1 # Use all available cores for grid search
     )
@@ -645,7 +712,8 @@ def train_model():
     print("\nModel Evaluation on Test Set with Best Estimator:")
     y_pred = best_model.predict(X_test)
     
-    print(classification_report(y_test, y_pred, target_names=['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)']))
+    # Add labels parameter to handle cases where test data doesn't have all classes
+    print(classification_report(y_test, y_pred, target_names=['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)'], labels=[0, 1, 2], zero_division=0))
     
     print("Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
