@@ -27,18 +27,44 @@ SESSIONS = {
 
 # --- Data Acquisition (Step 1) ---
 
-def fetch_historical(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=1000):
-    """Fetches historical klines from Binance."""
-    try:
-        klines = client.get_historical_klines(symbol=symbol, interval=interval, limit=limit)
-        return klines
-    except Exception as e:
-        print(f"Error fetching klines for {symbol}: {e}")
-        return []
+def fetch_historical(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, total_limit=20000):
+    """
+    Fetches historical klines from Binance, handling pagination to get more data.
+    """
+    all_klines = []
+    limit = 1000  # Max limit per request
+    
+    while len(all_klines) < total_limit:
+        try:
+            # If we have klines, fetch from before the oldest one
+            end_time = all_klines[0][0] if all_klines else None
+            
+            klines = client.get_historical_klines(
+                symbol=symbol, 
+                interval=interval, 
+                limit=min(limit, total_limit - len(all_klines)),
+                end_str=end_time
+            )
+
+            # If no more klines are returned, break the loop
+            if not klines:
+                break
+
+            # Prepend new klines to maintain chronological order
+            all_klines = klines + all_klines
+            
+            print(f"  - Fetched {len(klines)} more candles for {symbol}. Total: {len(all_klines)}/{total_limit}")
+
+        except Exception as e:
+            print(f"Error fetching klines for {symbol}: {e}")
+            break # Exit on error
+
+    return all_klines
+
 
 def fetch_initial_data():
     """
-    Fetches the most recent 1,000 fifteen-minute candles for each symbol
+    Fetches a large number of historical candles for each symbol
     in symbols.csv and saves them.
     """
     print("Starting initial data acquisition...")
@@ -49,23 +75,16 @@ def fetch_initial_data():
         return
 
     client = Client(keys.api_mainnet, keys.secret_mainnet)
-    data_limited_symbols = []
-
+    
     for symbol in symbols:
         print(f"Fetching data for {symbol}...")
-        klines = fetch_historical(client, symbol, limit=1000)
-        if len(klines) < 1000:
-            print(f"  - Warning: Received only {len(klines)} candles for {symbol}. Recording as data-limited.")
-            data_limited_symbols.append(symbol)
+        klines = fetch_historical(client, symbol, total_limit=20000) # Fetch 20,000 candles
 
         if klines:
-            # For the initial fetch, we want to save to a specific file.
-            process_and_save_kline_data(klines, symbol, "initial_1000.parquet")
+            # Save to a file named after the total number of candles
+            filename = f"initial_{len(klines)}.parquet"
+            process_and_save_kline_data(klines, symbol, filename)
 
-    if data_limited_symbols:
-        print("\nData-limited symbols (less than 1,000 candles):")
-        for symbol in data_limited_symbols:
-            print(f"- {symbol}")
     print("\nInitial data acquisition complete.")
 
 
@@ -118,11 +137,15 @@ def save_data_to_parquet(df, symbol, filename=None):
 def load_raw_data_for_symbol(symbol):
     """Loads all parquet files for a symbol and concatenates them."""
     symbol_dir = os.path.join(DATA_DIR, symbol)
-    # Prefer the initial_1000 file if it exists for training purposes
-    initial_file = os.path.join(symbol_dir, "initial_1000.parquet")
-    if os.path.exists(initial_file):
-        files = [initial_file]
+    
+    # Find any file starting with 'initial_'
+    initial_files = glob.glob(os.path.join(symbol_dir, "initial_*.parquet"))
+    
+    if initial_files:
+        # If there are multiple, prefer the one with the most candles (largest file)
+        files = [max(initial_files, key=os.path.getsize)]
     else:
+        # Fallback to any other parquet files if no 'initial_' file is found
         files = glob.glob(os.path.join(symbol_dir, "*.parquet"))
 
     if not files:
@@ -273,8 +296,27 @@ def find_and_label_setups(df):
 
     return pd.DataFrame(labeled_setups)
 
+from multiprocessing import Pool
+
+def process_symbol_for_labeling(symbol):
+    """Helper function to process and label setups for a single symbol."""
+    print(f"Processing {symbol}...")
+    df = load_raw_data_for_symbol(symbol)
+    if df is None or df.empty:
+        print(f"  - No raw data found for {symbol}. Skipping.")
+        return None
+
+    labeled_setups = find_and_label_setups(df)
+    if not labeled_setups.empty:
+        labeled_setups['symbol'] = symbol
+        print(f"  - Found and labeled {len(labeled_setups)} setups for {symbol}.")
+        return labeled_setups
+    else:
+        print(f"  - No valid setups found for {symbol}.")
+        return None
+
 def main_preprocess():
-    """Main function for preprocessing and labeling."""
+    """Main function for preprocessing and labeling, using multiprocessing."""
     print("Starting preprocessing and labeling...")
     os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
 
@@ -284,21 +326,12 @@ def main_preprocess():
         print(f"Error: {SYMBOLS_FILE} not found.")
         return
 
-    all_labeled_data = []
-    for symbol in symbols:
-        print(f"Processing {symbol}...")
-        df = load_raw_data_for_symbol(symbol)
-        if df is None or df.empty:
-            print(f"  - No raw data found for {symbol}. Skipping.")
-            continue
+    # Use multiprocessing.Pool to process symbols in parallel
+    with Pool() as pool:
+        results = pool.map(process_symbol_for_labeling, symbols)
 
-        labeled_setups = find_and_label_setups(df)
-        if not labeled_setups.empty:
-            labeled_setups['symbol'] = symbol
-            all_labeled_data.append(labeled_setups)
-            print(f"  - Found and labeled {len(labeled_setups)} setups for {symbol}.")
-        else:
-            print(f"  - No valid setups found for {symbol}.")
+    # Filter out None results
+    all_labeled_data = [res for res in results if res is not None]
 
     if all_labeled_data:
         final_df = pd.concat(all_labeled_data, ignore_index=True)
@@ -324,8 +357,16 @@ def calculate_rsi(df, period=14):
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
+    
+    # Avoid division by zero
     rs = gain / loss
+    rs = rs.replace([np.inf, -np.inf], np.nan) # Handle infinities if loss is 0
+
     rsi = 100 - (100 / (1 + rs))
+    
+    # When gain and loss are both 0, RSI is NaN. A neutral 50 is a common treatment.
+    rsi.fillna(50, inplace=True)
+    
     return rsi
 
 def calculate_macd(df, fast_period=12, slow_period=26, signal_period=9):
@@ -356,7 +397,7 @@ def engineer_features():
             df['rsi'] = calculate_rsi(df)
             df['macd'], df['macd_signal'] = calculate_macd(df)
             df['rolling_volatility'] = df['close'].pct_change().rolling(window=20).std()
-            df['liquidity_proxy'] = df['volume'].rolling(window=1000).mean()
+            df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
             df.set_index('timestamp', inplace=True)
             all_raw_data[symbol] = df
 
@@ -457,7 +498,7 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
     df['rsi'] = calculate_rsi(df)
     df['macd'], df['macd_signal'] = calculate_macd(df)
     df['rolling_volatility'] = df['close'].pct_change().rolling(window=20).std()
-    df['liquidity_proxy'] = df['volume'].rolling(window=1000).mean()
+    df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
 
     # Get the most recent candle for context features
     # The timestamp of the setup is the last candle in the klines_df
@@ -514,9 +555,11 @@ from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
 import joblib
 
+from sklearn.model_selection import GridSearchCV
+
 # --- Model Training (Step 4) ---
 def train_model():
-    """Loads features, trains a model, and saves it."""
+    """Loads features, trains a model with hyperparameter tuning, and saves it."""
     print("Starting model training...")
     try:
         features_df = pd.read_parquet(os.path.join(PROCESSED_DATA_DIR, "features.parquet"))
@@ -529,14 +572,12 @@ def train_model():
         return
 
     # --- Data Preparation ---
-    # Define feature columns to be used for training
     feature_columns = [
         'golden_zone_ratio', 'sl_pct', 'tp1_pct', 'tp2_pct',
         'is_asia', 'is_london', 'is_new_york',
         'atr', 'rsi', 'macd_diff', 'rolling_volatility',
         'liquidity_proxy'
     ]
-    # Ensure all feature columns exist and handle side as a categorical feature
     features_df['side_long'] = (features_df['side'] == 'long').astype(int)
     feature_columns.append('side_long')
 
@@ -544,7 +585,6 @@ def train_model():
     y = features_df['label']
 
     # --- Time-based Split ---
-    # Sort data by timestamp before splitting to simulate live trading
     sorted_indices = features_df['timestamp'].argsort()
     X = X.iloc[sorted_indices]
     y = y.iloc[sorted_indices]
@@ -555,37 +595,55 @@ def train_model():
     print(f"Testing data shape: {X_test.shape}")
 
     # --- Handle Class Imbalance ---
-    # Calculate class weights to give more importance to minority classes
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     weights_dict = {i : class_weights[i] for i, w in enumerate(class_weights)}
     print(f"Calculated class weights: {weights_dict}")
-
-    # Create a sample_weight array for the training data
     sample_weights = y_train.map(weights_dict)
 
-    # --- Model Fitting ---
-    # Initialize XGBoost Classifier with some baseline parameters
-    # objective='multi:softmax' tells XGBoost to do multiclass classification
-    # num_class=3 specifies the number of classes (0, 1, 2)
+    # --- Hyperparameter Tuning with GridSearchCV ---
+    # Define the parameter grid to search
+    # This is a small grid for demonstration; a real search would be larger.
+    param_grid = {
+        'max_depth': [3, 5, 7],
+        'learning_rate': [0.01, 0.1],
+        'n_estimators': [100, 200],
+        'subsample': [0.7, 0.8],
+    }
+
+    # Initialize XGBoost Classifier
+    # n_jobs=-1 uses all available CPU cores for training
     model = xgb.XGBClassifier(
         objective='multi:softmax',
         num_class=3,
         use_label_encoder=False,
         eval_metric='mlogloss',
-        n_estimators=100,
-        learning_rate=0.1,
-        max_depth=5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        gamma=0.1
+        n_jobs=-1  # Enable multithreading
     )
 
-    print("Training XGBoost model...")
-    model.fit(X_train, y_train, sample_weight=sample_weights, verbose=False)
+    # Initialize GridSearchCV
+    # cv=3 uses 3-fold cross-validation. TimeSeriesSplit is better for time-series data.
+    # We use n_jobs=-1 here as well to parallelize the grid search process.
+    grid_search = GridSearchCV(
+        estimator=model, 
+        param_grid=param_grid, 
+        scoring='f1_weighted', 
+        cv=3, 
+        verbose=1,
+        n_jobs=-1 # Use all available cores for grid search
+    )
+
+    print("Starting hyperparameter search with GridSearchCV...")
+    grid_search.fit(X_train, y_train, sample_weight=sample_weights)
+
+    print(f"\nBest parameters found: {grid_search.best_params_}")
+    print(f"Best f1_weighted score: {grid_search.best_score_}")
+
+    # Get the best model
+    best_model = grid_search.best_estimator_
 
     # --- Evaluation ---
-    print("\nModel Evaluation on Test Set:")
-    y_pred = model.predict(X_test)
+    print("\nModel Evaluation on Test Set with Best Estimator:")
+    y_pred = best_model.predict(X_test)
     
     print(classification_report(y_test, y_pred, target_names=['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)']))
     
@@ -596,9 +654,9 @@ def train_model():
     os.makedirs(MODELS_DIR, exist_ok=True)
     model_path = os.path.join(MODELS_DIR, "trading_model.joblib")
     
-    # Save the model and the feature columns together
+    # Save the best model and the feature columns together
     joblib.dump({
-        'model': model,
+        'model': best_model,
         'feature_columns': feature_columns
     }, model_path)
 
@@ -606,18 +664,34 @@ def train_model():
 
 
 def run_pipeline():
-    """Runs the full data pipeline from acquisition to model training."""
-    print("--- Running Step 1: Data Acquisition ---")
-    fetch_initial_data() 
-    
-    print("\n--- Running Step 2: Preprocessing and Labeling ---")
-    main_preprocess()
+    """
+    Runs the full data pipeline from acquisition to model training,
+    skipping steps if the data already exists.
+    """
+    features_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
+    labeled_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
 
-    print("\n--- Running Step 3: Feature Engineering ---")
-    engineer_features()
+    if os.path.exists(features_path):
+        print("--- Found existing features.parquet. Skipping to Step 4: Model Training ---")
+        train_model()
+    elif os.path.exists(labeled_path):
+        print("--- Found existing labeled_trades.parquet. Skipping to Step 3: Feature Engineering ---")
+        engineer_features()
+        print("\n--- Running Step 4: Model Training ---")
+        train_model()
+    else:
+        print("--- Running full pipeline from scratch ---")
+        print("--- Running Step 1: Data Acquisition ---")
+        fetch_initial_data()
+        
+        print("\n--- Running Step 2: Preprocessing and Labeling ---")
+        main_preprocess()
 
-    print("\n--- Running Step 4: Model Training ---")
-    train_model()
+        print("\n--- Running Step 3: Feature Engineering ---")
+        engineer_features()
+
+        print("\n--- Running Step 4: Model Training ---")
+        train_model()
 
 if __name__ == '__main__':
     import argparse
