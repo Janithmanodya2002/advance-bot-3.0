@@ -1,2 +1,2 @@
-risk_per_trade,leverage,atr_value,lookback_candles,swing_window,starting_balance,chart_image_candles,risk_amount_usd,use_fixed_risk_amount,max_open_positions
-0,30,14,100,5,1000,200,0.5,True,3
+risk_per_trade,leverage,atr_value,lookback_candles,swing_window,starting_balance,chart_image_candles,risk_amount_usd,use_fixed_risk_amount,max_open_positions,min_win_probability,min_tp2_probability
+0,30,14,100,5,1000,200,0.5,True,3,0.6,0.4

@@ -1130,6 +1130,8 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
         await asyncio.sleep(5)
 
 
+import joblib
+
 # Global variables for trades
 virtual_orders = {}
 trades = []
@@ -1137,6 +1139,13 @@ leverage = 0
 chart_image_candles = 0
 trades_lock = threading.Lock()
 rejected_symbols = {}
+
+# ML Model globals
+model = None
+feature_columns = None
+min_win_probability = 0.6
+min_tp2_probability = 0.4
+
 
 async def main():
     """
@@ -1168,6 +1177,12 @@ async def main():
         starting_balance = int(config['starting_balance'])
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
+
+        # Load ML model thresholds
+        global min_win_probability, min_tp2_probability
+        min_win_probability = float(config['min_win_probability'])
+        min_tp2_probability = float(config['min_tp2_probability'])
+
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1209,6 +1224,19 @@ async def main():
     if mode == '1' or mode == '2':
         live_mode = mode == '1'
         print(f"Running in {'Live' if live_mode else 'Signal'} mode.")
+
+        # Load the ML model
+        global model, feature_columns
+        try:
+            model_data = joblib.load(os.path.join("models", "trading_model.joblib"))
+            model = model_data['model']
+            feature_columns = model_data['feature_columns']
+            print("ML model loaded successfully.")
+        except FileNotFoundError:
+            print("Error: trading_model.joblib not found. Please train the model first.")
+            print("Bot will run without ML-based filtering.")
+            model = None # Ensure model is None if loading fails
+
         try:
             client = Client(keys.api_mainnet, keys.secret_mainnet)
             print("Binance client initialized.")
@@ -1269,7 +1297,7 @@ async def main():
             except json.JSONDecodeError:
                 pass
 
-    monitor_thread = threading.Thread(target=run_monitor, args=(backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
+    monitor_thread = threading.Thread(target=order_status_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
     monitor_thread.start()
 
     if backtest_mode:
@@ -1342,68 +1370,110 @@ async def main():
 
                     print(f"Scanning {symbol}...")
                     klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
-                    if not klines:
+                    if not klines or len(klines) < lookback_candles:
                         continue
 
                     swing_highs, swing_lows = get_swing_points(klines, swing_window)
                     trend = get_trend(swing_highs, swing_lows)
 
-                    current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                    if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
-                            continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
-                        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                        if current_price < entry_price:
-                            continue
+                    if trend in ["downtrend", "uptrend"] and len(swing_highs) > 1 and len(swing_lows) > 1:
 
-                        sl = last_swing_high
-                        tp1 = entry_price - (sl - entry_price)
-                        tp2 = entry_price - (sl - entry_price) * 2
+                        setup_info = {}
+                        if trend == "downtrend":
+                            if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000: continue
+                            last_swing_high = swing_highs[-1][1]
+                            last_swing_low = swing_lows[-1][1]
+                            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+                            current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                            if current_price < entry_price: continue
+
+                            sl = last_swing_high
+                            tp1 = entry_price - (sl - entry_price)
+                            tp2 = entry_price - (sl - entry_price) * 2
+                            setup_info = {'side': 'short', 'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low}
+
+                        else: # uptrend
+                            if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000: continue
+                            last_swing_high = swing_highs[-1][1]
+                            last_swing_low = swing_lows[-1][1]
+                            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+                            current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                            if current_price > entry_price: continue
+
+                            sl = last_swing_low
+                            tp1 = entry_price + (entry_price - sl)
+                            tp2 = entry_price + (entry_price - sl) * 2
+                            setup_info = {'side': 'long', 'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low}
+
+                        # --- ML Inference Step ---
+                        final_risk = risk_per_trade
+                        model_decision = "N/A"
+                        model_confidence = {}
+
+                        if model and feature_columns:
+                            # 1. Generate feature vector
+                            klines_df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+                            klines_df = klines_df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                            for col in klines_df.columns: klines_df[col] = pd.to_numeric(klines_df[col])
+
+                            live_setup_info = {**setup_info, 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2}
+                            feature_vector = ML.generate_features_for_live_setup(klines_df, live_setup_info, feature_columns)
+
+                            # 2. Predict probabilities
+                            probabilities = model.predict_proba(feature_vector)[0]
+                            prob_loss, prob_tp1, prob_tp2 = probabilities[0], probabilities[1], probabilities[2]
+                            prob_win = prob_tp1 + prob_tp2
+                            model_confidence = {'loss': prob_loss, 'tp1': prob_tp1, 'tp2': prob_tp2}
+
+                            # 3. Apply threshold logic
+                            if prob_win < min_win_probability:
+                                print(f"Model rejected {symbol} {setup_info['side']}. Win prob {prob_win:.2f} < {min_win_probability}")
+                                continue # Skip trade
+
+                            model_decision = f"Accepted (Win: {prob_win:.2f})"
+
+                            # 4. Adjust risk based on TP2 probability
+                            if prob_tp2 < min_tp2_probability:
+                                final_risk = risk_per_trade / 2
+                                model_decision += f", Reduced Risk (TP2: {prob_tp2:.2f} < {min_tp2_probability})"
+                            else:
+                                model_decision += f", Full Risk (TP2: {prob_tp2:.2f} >= {min_tp2_probability})"
+                        else:
+                            print("Warning: ML model not loaded. Proceeding without ML filter.")
+                        # --- End ML Inference ---
 
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
+                        quantity = calculate_quantity(client, symbol_info, final_risk, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
                         if quantity is None or quantity == 0:
                             continue
 
-                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}"
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, backtest_mode)
+                        image_buffer = generate_fib_chart(symbol, klines, trend, setup_info['swing_high_price'], setup_info['swing_low_price'], entry_price, sl, tp1, tp2)
+                        caption = (f"🚀 NEW TRADE SIGNAL 🚀\n"
+                                   f"Symbol: {symbol}\n"
+                                   f"Side: {setup_info['side'].capitalize()}\n"
+                                   f"Leverage: {leverage}x\n"
+                                   f"Risk: {final_risk}%\n"
+                                   f"Proposed Entry: {entry_price:.8f}\n"
+                                   f"Stop Loss: {sl:.8f}\n"
+                                   f"Take Profit 1: {tp1:.8f}\n"
+                                   f"Take Profit 2: {tp2:.8f}\n\n"
+                                   f"🤖 Model: {model_decision}\n"
+                                   f"   - P(Win): {model_confidence.get('tp1', 0) + model_confidence.get('tp2', 0):.2%}\n"
+                                   f"   - P(TP2): {model_confidence.get('tp2', 0):.2%}")
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
+                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+
+                        new_trade = {
+                            'symbol': symbol, 'side': setup_info['side'], 'entry_price': entry_price,
+                            'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity,
+                            'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None,
+                            'model_decision': model_decision, 'model_confidence': model_confidence
+                        }
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
                         update_trade_report(trades)
 
-                    elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
-                            continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
-                        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                        if current_price > entry_price:
-                            continue
-
-                        sl = last_swing_low
-                        tp1 = entry_price + (entry_price - last_swing_low)
-                        tp2 = entry_price + (entry_price - last_swing_low) * 2
-
-                        symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
-                        if quantity is None or quantity == 0:
-                            continue
-
-                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}"
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, backtest_mode)
-
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
-                        with trades_lock:
-                            trades.append(new_trade)
-                        virtual_orders[symbol] = new_trade
-                        update_trade_report(trades)
                 except Exception as e:
                     print(f"Error scanning {symbol}: {e}")
                     rejected_symbols[symbol] = time.time()
