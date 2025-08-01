@@ -202,7 +202,7 @@ def get_fib_retracement(p1, p2, trend):
     
     return entry_price
 
-def calculate_quantity(client, symbol, risk_per_trade, sl_price, entry_price, leverage):
+def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage):
     """
     Calculate the order quantity based on risk and leverage.
     """
@@ -229,13 +229,20 @@ def calculate_quantity(client, symbol, risk_per_trade, sl_price, entry_price, le
         quantity = final_position_size / entry_price
         
         # Adjust for symbol's precision
-        info = client.get_symbol_info(symbol)
-        step_size = float(info['filters'][1]['stepSize'])
+        step_size = None
+        for f in symbol_info['filters']:
+            if f['filterType'] == 'LOT_SIZE':
+                step_size = float(f['stepSize'])
+                break
+        if step_size is None:
+            print(f"Could not find LOT_SIZE filter for {symbol_info['symbol']}")
+            return None
+        
         quantity = (quantity // step_size) * step_size
         
         return quantity
     except Exception as e:
-        print(f"Error calculating quantity for {symbol}: {e}")
+        print(f"Error calculating quantity for {symbol_info['symbol']}: {e}")
         return None
 
 def get_atr(klines, period=14):
@@ -747,36 +754,66 @@ def update_trade_report(trades, backtest_mode=False):
         with open('trades.json', 'w') as f:
             json.dump(trades, f, indent=4, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else o)
 
-async def place_real_order(client, symbol, side, quantity, bot, live_mode=False):
-    """
-    Place a real order on Binance.
-    """
-    if not live_mode:
-        print(f"VIRTUAL ORDER: Placing {side} order for {quantity} {symbol}")
-        return {"status": "success"}
+async def place_new_order(client, symbol_info, side, order_type, quantity, price=None, stop_price=None, reduce_only=None, position_side=None, is_closing_order=False):
+    symbol = symbol_info['symbol']
+    p_prec = int(symbol_info['pricePrecision'])
+    q_prec = int(symbol_info['quantityPrecision'])
+    
+    params = {
+        "symbol": symbol,
+        "side": side.upper(),
+        "type": order_type.upper(),
+        "quantity": f"{quantity:.{q_prec}f}"
+    }
+
+    if position_side:
+        params["positionSide"] = position_side.upper()
+
+    if order_type.upper() in ["LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]:
+        if price is None:
+            print(f"Price needed for {order_type} on {symbol}")
+            return None, "Price needed"
+        params.update({
+            "price": f"{price:.{p_prec}f}",
+            "timeInForce": "GTC"
+        })
+
+    if order_type.upper() in ["STOP_MARKET", "TAKE_PROFIT_MARKET", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"]:
+        if stop_price is None:
+            print(f"Stop price needed for {order_type} on {symbol}")
+            return None, "Stop price needed"
+        params["stopPrice"] = f"{stop_price:.{p_prec}f}"
+        if is_closing_order:
+            params["closePosition"] = "true"
+            params.pop("reduceOnly", None)
+        elif reduce_only is not None:
+            params["reduceOnly"] = str(reduce_only).lower()
+    elif reduce_only is not None:
+        params["reduceOnly"] = str(reduce_only).lower()
+
     try:
-        if side.lower() == 'long':
-            order_side = Client.SIDE_BUY
-        elif side.lower() == 'short':
-            order_side = Client.SIDE_SELL
-        else:
-            raise ValueError("Side must be 'long' or 'short'")
-            
-        order = client.create_order(
-            symbol=symbol,
-            side=order_side,
-            type=Client.ORDER_TYPE_MARKET,
-            quantity=quantity
-        )
-        print(f"Placed {side} order for {quantity} {symbol}: {order}")
-        return {"status": "success", "order": order}
+        loop = asyncio.get_running_loop()
+        order = await loop.run_in_executor(None, lambda: client.futures_create_order(**params))
+        
+        print(f"Order PLACED: {order['symbol']} ID {order['orderId']} "
+              f"{order.get('positionSide','N/A')} {order['side']} "
+              f"{order['type']} {order['origQty']} @ "
+              f"{order.get('price','MARKET')} SP:{order.get('stopPrice','N/A')} "
+              f"CP:{order.get('closePosition','false')} "
+              f"RO:{order.get('reduceOnly','false')} "
+              f"AvgP:{order.get('avgPrice','N/A')} "
+              f"Status:{order['status']}")
+        return order, None
+    except BinanceAPIException as e:
+        error_msg = (f"ORDER FAILED for {symbol} {side} {quantity} "
+                     f"{order_type}: {str(e)}")
+        print(error_msg)
+        return None, str(e)
     except Exception as e:
-        print(f"Error placing real order for {symbol}: {e}")
-        try:
-            await bot.send_message(chat_id=keys.telegram_chat_id, text=f"⚠️ ORDER FAILED ⚠️\nSymbol: {symbol}\nSide: {side}\nQuantity: {quantity}\nError: {e}")
-        except Exception as telegram_e:
-            print(f"Error sending Telegram message: {telegram_e}")
-        return {"status": "error", "message": str(e)}
+        error_msg = (f"UNEXPECTED ORDER FAILED for {symbol} {side} {quantity} "
+                     f"{order_type}: {str(e)}")
+        print(error_msg)
+        return None, str(e)
 
 async def send_telegram_alert(bot, message):
     """A simple helper function to send a Telegram message."""
@@ -870,7 +907,7 @@ async def op_command(update, context):
             caption = f"Open Trade: {symbol}\nSide: {trade['side']}\nEntry: {trade['entry_price']:.8f}\nCurrent Price: {current_price:.8f}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}"
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_buffer, caption=caption)
 
-async def order_status_monitor(client, application, backtest_mode=False, live_mode=False):
+async def order_status_monitor(client, application, backtest_mode=False, live_mode=False, symbols_info=None, is_hedge_mode=False):
     """
     Continuously monitor the status of open and pending trades.
     """
@@ -986,9 +1023,19 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                             if (trade['side'] == 'long' and price >= trade['entry_price']) or \
                                (trade['side'] == 'short' and price <= trade['entry_price']):
                                 
-                                # In a real scenario, you would place a limit order here
                                 if live_mode:
-                                    await place_real_order(client, symbol, trade['side'], trade['quantity'], bot, live_mode=live_mode)
+                                    symbol_info = symbols_info[symbol]
+                                    pos_side = None
+                                    if is_hedge_mode:
+                                        pos_side = 'LONG' if trade['side'] == 'long' else 'SHORT'
+                                    
+                                    order, err = await place_new_order(client, symbol_info, 'BUY' if trade['side'] == 'long' else 'SELL', 'MARKET', trade['quantity'], position_side=pos_side)
+                                    if err:
+                                        await send_telegram_alert(bot, f"⚠️ ORDER FAILED for {symbol}: {err}")
+                                        trade['status'] = 'rejected'
+                                        if symbol in virtual_orders: del virtual_orders[symbol]
+                                        break
+                                
                                 trade['status'] = 'running'
                                 update_trade_report(trades)
                                 try:
@@ -1062,8 +1109,17 @@ async def main():
     try:
         client = Client(keys.api_mainnet, keys.secret_mainnet)
         print("Binance client initialized.")
+
+        # Fetch exchange info and position mode
+        exchange_info = client.futures_exchange_info()
+        symbols_info = {symbol['symbol']: symbol for symbol in exchange_info['symbols']}
+        position_mode = client.futures_get_position_mode()
+        is_hedge_mode = position_mode.get('dualSidePosition')
+        
+        print(f"Futures position mode: {'Hedge Mode' if is_hedge_mode else 'One-way Mode'}")
+
     except Exception as e:
-        print(f"Error initializing Binance client: {e}")
+        print(f"Error initializing Binance client or fetching info: {e}")
         return
 
     # Check API key permissions
@@ -1080,10 +1136,10 @@ async def main():
     application = ApplicationBuilder().token(keys.telegram_bot_token).build()
     
     # Start the order status monitor in a separate thread
-    def run_monitor(backtest_mode, live_mode):
+    def run_monitor(backtest_mode, live_mode, symbols_info, is_hedge_mode):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode))
+        loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode))
 
     op_handler = CommandHandler('op', op_command)
     application.add_handler(op_handler)
@@ -1148,7 +1204,7 @@ async def main():
             except json.JSONDecodeError:
                 pass
     
-    monitor_thread = threading.Thread(target=run_monitor, args=(backtest_mode, live_mode), daemon=True)
+    monitor_thread = threading.Thread(target=run_monitor, args=(backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
     monitor_thread.start()
 
 
@@ -1161,7 +1217,7 @@ async def main():
             'swing_window': swing_window,
             'starting_balance': starting_balance
         }
-        backtest_trades = run_backtest(client, symbols, days_to_backtest, config_dict)
+        backtest_trades = run_backtest(client, symbols, days_to_backtest, config_dict, symbols_info)
         metrics = calculate_performance_metrics(backtest_trades, starting_balance)
         strategy_analysis = analyze_strategy_behavior(backtest_trades)
         generate_backtest_report(backtest_trades, config_dict, starting_balance)
@@ -1207,7 +1263,8 @@ async def main():
                         tp2 = entry_price - (sl - entry_price) * 2
                         tp3 = 0 # Floating TP
                         
-                        quantity = calculate_quantity(client, symbol, risk_per_trade, sl, entry_price, leverage)
+                        symbol_info = symbols_info[symbol]
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage)
                         if quantity is None or quantity == 0:
                             continue
                         
@@ -1235,7 +1292,8 @@ async def main():
                         tp2 = entry_price + (entry_price - last_swing_low) * 2
                         tp3 = 0 # Floating TP
 
-                        quantity = calculate_quantity(client, symbol, risk_per_trade, sl, entry_price, leverage)
+                        symbol_info = symbols_info[symbol]
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage)
                         if quantity is None or quantity == 0:
                             continue
 
