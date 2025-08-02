@@ -585,10 +585,26 @@ def engineer_features():
     print(f"Feature vectors remaining after final dropna: {len(features_df)}")
 
     os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-    save_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
-    features_df.to_parquet(save_path)
-    print(f"Feature engineering complete. Features saved to {save_path}")
-    print(f"Generated {len(features_df)} feature vectors.")
+    
+    # --- Chunking Logic ---
+    chunk_size = 25000
+    num_chunks = int(np.ceil(len(features_df) / chunk_size))
+    
+    # Clean up old single file if it exists
+    old_file_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
+    if os.path.exists(old_file_path):
+        os.remove(old_file_path)
+
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = start_idx + chunk_size
+        chunk_df = features_df.iloc[start_idx:end_idx]
+        
+        save_path = os.path.join(PROCESSED_DATA_DIR, f"features_part_{i+1}.parquet")
+        chunk_df.to_parquet(save_path)
+        print(f"Saved chunk {i+1}/{num_chunks} to {save_path}")
+
+    print(f"Feature engineering complete. Generated {len(features_df)} feature vectors in {num_chunks} chunks.")
 
 
 def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
@@ -697,21 +713,38 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
 
 import joblib
 from tqdm.auto import tqdm
+from datetime import datetime
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 
 import lightgbm as lgb
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.calibration import CalibratedClassifierCV, CalibrationDisplay
 
 
 # --- Model Training (Step 4) ---
 def train_model():
-    """Loads features, trains a model with hyperparameter tuning, and saves it."""
+    """Loads features, trains a model, calibrates it, and saves it."""
     print("Starting model training...")
     try:
-        features_df = pd.read_parquet(os.path.join(PROCESSED_DATA_DIR, "features.parquet"))
+        feature_files = glob.glob(os.path.join(PROCESSED_DATA_DIR, "features_part_*.parquet"))
+        if not feature_files:
+            raise FileNotFoundError("No feature chunk files found.")
+        
+        df_list = [pd.read_parquet(f) for f in feature_files]
+        features_df = pd.concat(df_list, ignore_index=True)
+        # Sort by timestamp to ensure chronological order is maintained after concatenation
+        features_df.sort_values('timestamp', inplace=True)
+        features_df.reset_index(drop=True, inplace=True)
+        
+        print(f"Loaded {len(features_df)} features from {len(feature_files)} chunk files.")
+        
     except FileNotFoundError:
-        print("Error: features.parquet not found. Please run engineer_features() first.")
+        print("Error: No feature chunk files found. Please run engineer_features() first.")
         return
 
     if features_df.empty:
@@ -738,32 +771,40 @@ def train_model():
     X = features_df[feature_columns]
     y = features_df['label']
 
-    # --- Time-based Split ---
-    sorted_indices = features_df['timestamp'].argsort()
-    X = X.iloc[sorted_indices]
-    y = y.iloc[sorted_indices]
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-    
+    # --- Time-based Split (60% train, 20% calibrate, 20% test) ---
+    n_samples = len(X)
+    train_end_idx = int(n_samples * 0.6)
+    cal_end_idx = int(n_samples * 0.8)
+
+    X_train, y_train = X.iloc[:train_end_idx], y.iloc[:train_end_idx]
+    X_cal, y_cal = X.iloc[train_end_idx:cal_end_idx], y.iloc[train_end_idx:cal_end_idx]
+    X_test, y_test = X.iloc[cal_end_idx:], y.iloc[cal_end_idx:]
+
     print(f"Training data shape: {X_train.shape}")
+    print(f"Calibration data shape: {X_cal.shape}")
     print(f"Testing data shape: {X_test.shape}")
 
+
     # --- Handle Class Imbalance ---
+    # Compute weights on the training data to ensure consistent weighting
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
     weights_dict = {i : class_weights[i] for i, w in enumerate(class_weights)}
     print(f"Calculated class weights: {weights_dict}")
-    sample_weights = y_train.map(weights_dict)
+    
+    # Map weights to the training and calibration sets
+    train_sample_weights = y_train.map(weights_dict)
+    cal_sample_weights = y_cal.map(weights_dict)
 
     # --- Model Training with User-Defined Parameters ---
     # Parameters provided by the user
     user_params = {
-        'subsample': 0.7, 
-        'reg_lambda': 0.5, 
-        'reg_alpha': 0.1, 
-        'num_leaves': 70, 
-        'n_estimators': 300, 
-        'max_depth': -1, 
-        'learning_rate': 0.1, 
+        'subsample': 0.7,
+        'reg_lambda': 0.5,
+        'reg_alpha': 0.1,
+        'num_leaves': 70,
+        'n_estimators': 300,
+        'max_depth': -1,
+        'learning_rate': 0.1,
         'colsample_bytree': 0.9,
         'objective': 'multiclass',
         'num_class': 3,
@@ -771,33 +812,138 @@ def train_model():
         'random_state': 42 # for reproducibility
     }
 
-    print(f"Training model with user-defined parameters: {user_params}")
+    print(f"Training base model with user-defined parameters...")
+    base_model = lgb.LGBMClassifier(**user_params)
+    base_model.fit(X_train, y_train, sample_weight=train_sample_weights)
 
-    # Initialize and train the LightGBM Classifier
-    best_model = lgb.LGBMClassifier(**user_params)
-    best_model.fit(X_train, y_train, sample_weight=sample_weights)
+    # --- Probability Calibration ---
+    print("\nCalibrating model probabilities using Isotonic Regression...")
+    # We use cv='prefit' because the base_model is already trained.
+    calibrated_model = CalibratedClassifierCV(
+        base_model,
+        method='isotonic',
+        cv='prefit'
+    )
+    calibrated_model.fit(X_cal, y_cal, sample_weight=cal_sample_weights)
 
     # --- Evaluation ---
-    print("\nModel Evaluation on Test Set:")
-    y_pred = best_model.predict(X_test)
+    print("\nEvaluating CALIBRATED Model on Test Set:")
+    y_pred = calibrated_model.predict(X_test)
     
     # Add labels parameter to handle cases where test data doesn't have all classes
     print(classification_report(y_test, y_pred, target_names=['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)'], labels=[0, 1, 2], zero_division=0))
     
-    print("Confusion Matrix:")
+    print("Confusion Matrix (Calibrated Model):")
     print(confusion_matrix(y_test, y_pred))
 
     # --- Persistence ---
     os.makedirs(MODELS_DIR, exist_ok=True)
     model_path = os.path.join(MODELS_DIR, "trading_model.joblib")
     
-    # Save the best model and the feature columns together
-    joblib.dump({
-        'model': best_model,
+    # --- Persistence ---
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    model_path = os.path.join(MODELS_DIR, "trading_model.joblib")
+    
+    model_artifact = {
+        'model_version': '1.2.0', # Major.Minor.Patch
+        'training_timestamp_utc': datetime.utcnow().isoformat(),
+        'calibrated_model': calibrated_model,
+        'uncalibrated_model': base_model, # Explicitly name the uncalibrated model
         'feature_columns': feature_columns
-    }, model_path)
+    }
+    
+    joblib.dump(model_artifact, model_path)
 
-    print(f"\nModel and metadata saved to {model_path}")
+    print(f"\nCalibrated model artifact saved to {model_path}")
+    print(f"  - Version: {model_artifact['model_version']}")
+    print(f"  - Timestamp: {model_artifact['training_timestamp_utc']}")
+
+    # --- Post-Training Validation and Monitoring ---
+    try:
+        plot_and_save_calibration_curve(calibrated_model, X_test, y_test, model_artifact)
+    except Exception as e:
+        print(f"Warning: Could not generate or save calibration curve. Error: {e}")
+
+    log_probability_distributions(calibrated_model, X_test)
+
+    try:
+        smoke_test_model_artifact(model_path, X_test)
+    except Exception as e:
+        print(f"Critical: Model artifact smoke test failed! Error: {e}")
+
+
+def smoke_test_model_artifact(model_path, X_test):
+    """
+    Loads a saved model artifact and runs a quick prediction to ensure it's not corrupt.
+    """
+    print("\n--- Running Model Artifact Smoke Test ---")
+    try:
+        model_data = joblib.load(model_path)
+        model = model_data['calibrated_model']
+        
+        # Predict on a small sample
+        sample_predictions = model.predict_proba(X_test.head(5))
+        
+        assert sample_predictions.shape == (5, 3)
+        print("Smoke test PASSED. Model loaded and predicted successfully.")
+        
+    except Exception as e:
+        print(f"Smoke test FAILED: {e}")
+        raise # Re-raise the exception to make the failure obvious
+
+
+def plot_and_save_calibration_curve(model, X_test, y_test, model_artifact):
+    """
+    Generates and saves a calibration curve plot for the given model.
+    """
+    print("\nGenerating calibration curve...")
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    for i, name in enumerate(['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)']):
+        CalibrationDisplay.from_estimator(
+            model,
+            X_test,
+            y_test,
+            n_bins=10,
+            class_to_plot=i,
+            name=f'Calibrated - {name}',
+            ax=ax,
+            strategy='uniform'
+        )
+    
+    ax.set_title("Calibration Curve for Each Class")
+    plt.grid(True)
+    
+    timestamp = model_artifact['training_timestamp_utc'].replace(':', '-')
+    calibration_plot_path = os.path.join(MODELS_DIR, f"calibration_curve_{timestamp}.png")
+    plt.savefig(calibration_plot_path)
+    print(f"Calibration curve saved to {calibration_plot_path}")
+    plt.close()
+
+
+def log_probability_distributions(model, X_test):
+    """
+    Scores a model on the test set and logs the distribution of predicted probabilities.
+    """
+    print("\n--- Post-Training Probability-Drift Monitoring ---")
+    if not hasattr(model, "predict_proba"):
+        print("Model does not support probability prediction.")
+        return
+        
+    # Get predicted probabilities for the test set
+    probabilities = model.predict_proba(X_test)
+    
+    # Calculate the mean probability for each class
+    mean_probs = np.mean(probabilities, axis=0)
+    
+    print("Mean Predicted Probabilities on Test Set:")
+    if len(mean_probs) == 3:
+        print(f"  - P(Loss): {mean_probs[0]:.3f}")
+        print(f"  - P(TP1):  {mean_probs[1]:.3f}")
+        print(f"  - P(TP2):  {mean_probs[2]:.3f}")
+    else:
+        print(f"  - {mean_probs}")
+    print("--------------------------------------------------")
 
 
 def run_pipeline():
