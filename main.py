@@ -654,18 +654,20 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
     """
     print("Starting backtest...")
 
-    # Load the ML model
+    # Load the ML model artifact for backtesting
     try:
-        model_data = joblib.load('models/trading_model.joblib')
-        ml_model = model_data['model']
-        ml_feature_columns = model_data['feature_columns']
-        print("ML model loaded for backtesting.")
+        model_artifact_path = 'models/trading_model_v2.joblib'
+        backtest_model_artifact = joblib.load(model_artifact_path)
+        backtest_feature_columns = backtest_model_artifact['feature_columns']
+        print(f"Ensemble ML model v{backtest_model_artifact.get('model_version', 'N/A')} loaded for backtesting.")
     except FileNotFoundError:
-        print("ML model not found. Backtest will run without ML filtering.")
-        ml_model = None
+        print(f"ML model not found at {model_artifact_path}. Backtest will run without ML filtering.")
+        backtest_model_artifact = None
+        backtest_feature_columns = []
     except Exception as e:
         print(f"Error loading ML model: {e}. Backtest will run without ML filtering.")
-        ml_model = None
+        backtest_model_artifact = None
+        backtest_feature_columns = []
 
     end_date = datetime.datetime.now(pytz.utc)
     start_date = end_date - datetime.timedelta(days=days_to_backtest)
@@ -727,12 +729,13 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 tp2 = entry_price - (sl - entry_price) * 2
 
                 expected_r = 0
-                if ml_model:
+                if backtest_model_artifact:
                     setup_info = {
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                     }
-                    prediction, probabilities = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
+                    # Pass the entire artifact to the prediction function
+                    prediction, probabilities = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, backtest_model_artifact, backtest_feature_columns)
                     expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
                     
                     if expected_r < config.get('min_expected_r', 0.1):
@@ -809,12 +812,12 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 tp2 = entry_price + (entry_price - last_swing_low) * 2
 
                 expected_r = 0
-                if ml_model:
+                if backtest_model_artifact:
                     setup_info = {
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                     }
-                    prediction, probabilities = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
+                    prediction, probabilities = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, backtest_model_artifact, backtest_feature_columns)
                     expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
 
                     if expected_r < config.get('min_expected_r', 0.1):
@@ -1243,7 +1246,7 @@ leverage = 0
 chart_image_candles = 0
 trades_lock = threading.Lock()
 rejected_symbols = {}
-ml_model = None
+ml_model_artifact = None # Will hold the entire dictionary
 ml_feature_columns = None
 model_confidence_threshold = 0.7 # Default value
 
@@ -1268,23 +1271,31 @@ def calculate_expected_r(probabilities, entry_price, sl, tp1, tp2):
     expected_r = (p_tp1 * tp1_r) + (p_tp2 * tp2_r) - (p_loss * 1) # Risk is 1R
     return expected_r
 
-def get_model_prediction(klines, setup_info, model, feature_columns):
+def get_model_prediction(klines, setup_info, model_artifact, feature_columns):
     """
-    Generates features for a live setup and gets a prediction and probability vector from the ML model.
+    Generates features and gets an ensembled prediction from the ML model artifact.
     """
-    # Convert klines to a DataFrame for the feature generation function
     klines_df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    for col in ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_asset_volume']:
         klines_df[col] = pd.to_numeric(klines_df[col], errors='coerce')
 
-    # Generate the feature vector
-    feature_vector = ML.generate_features_for_live_setup(klines_df, setup_info, feature_columns)
+    # Get models and thresholds from artifact
+    lgbm_model = model_artifact['lgbm_model']
+    xgb_model = model_artifact['xgb_model']
+    vol_thresholds = model_artifact['vol_thresholds']
+
+    # Generate the feature vector, passing the volatility thresholds
+    feature_vector = ML.generate_features_for_live_setup(klines_df, setup_info, feature_columns, vol_thresholds)
     
-    # Make prediction
-    prediction = model.predict(feature_vector)[0]
-    probabilities = model.predict_proba(feature_vector)[0]
+    # Get probabilities from both models
+    lgbm_proba = lgbm_model.predict_proba(feature_vector)[0]
+    xgb_proba = xgb_model.predict_proba(feature_vector)[0]
     
-    return prediction, probabilities
+    # Average the probabilities for the ensemble prediction
+    ensemble_proba = (lgbm_proba + xgb_proba) / 2
+    prediction = np.argmax(ensemble_proba)
+    
+    return prediction, ensemble_proba
 
 
 def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
@@ -1300,7 +1311,6 @@ async def main():
     """
     print("Starting bot...")
 
-    # Get and print public IP address
     public_ip = get_public_ip()
     if public_ip:
         print(f"Public IP Address: {public_ip}")
@@ -1310,45 +1320,32 @@ async def main():
     bot = telegram.Bot(token=keys.telegram_bot_token)
 
     # Load configuration
-    global leverage, chart_image_candles, ml_model, ml_feature_columns, model_confidence_threshold
+    global leverage, chart_image_candles, ml_model_artifact, ml_feature_columns, model_confidence_threshold
     try:
         config_df = pd.read_csv('configuration.csv').iloc[0]
         config = config_df.to_dict()
-        risk_per_trade = config['risk_per_trade']
-        risk_amount_usd = config['risk_amount_usd']
-        use_fixed_risk_amount = config['use_fixed_risk_amount']
-        leverage = config['leverage']
-        atr_value = int(config['atr_value'])
-        lookback_candles = int(config['lookback_candles'])
-        swing_window = int(config['swing_window'])
-        starting_balance = int(config['starting_balance'])
-        chart_image_candles = int(config['chart_image_candles'])
-        max_open_positions = int(config['max_open_positions'])
-        model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # DEPRECATED
-        min_expected_r = config.get('min_expected_r', 0.15) # New threshold
-        max_risk_scaling_factor = config.get('max_risk_scaling_factor', 1.5) # New sizing cap
-        min_p2_confidence = config.get('min_p2_confidence', 0.3) # New rule
-        max_p0_confidence = config.get('max_p0_confidence', 0.4) # New rule
+        risk_per_trade, risk_amount_usd, use_fixed_risk_amount = config['risk_per_trade'], config['risk_amount_usd'], config['use_fixed_risk_amount']
+        leverage, atr_value, lookback_candles, swing_window = config['leverage'], int(config['atr_value']), int(config['lookback_candles']), int(config['swing_window'])
+        starting_balance, chart_image_candles, max_open_positions = int(config['starting_balance']), int(config['chart_image_candles']), int(config['max_open_positions'])
+        min_expected_r, max_risk_scaling_factor = config.get('min_expected_r', 0.15), config.get('max_risk_scaling_factor', 1.5)
+        min_p2_confidence, max_p0_confidence = config.get('min_p2_confidence', 0.3), config.get('max_p0_confidence', 0.4)
         print("Configuration loaded.")
-    except FileNotFoundError:
-        print("Error: configuration.csv not found.")
-        return
     except Exception as e:
         print(f"Error loading configuration: {e}")
         return
 
-    # Load the ML model
+    # Load the ML model artifact
     try:
-        model_data = joblib.load('models/trading_model.joblib')
-        ml_model = model_data['calibrated_model'] # Use the explicitly named calibrated model
-        ml_feature_columns = model_data['feature_columns']
-        print(f"Calibrated ML model v{model_data.get('model_version', 'N/A')} loaded. Min Expected R threshold is {min_expected_r}.")
+        model_artifact_path = 'models/trading_model_v2.joblib'
+        ml_model_artifact = joblib.load(model_artifact_path)
+        ml_feature_columns = ml_model_artifact['feature_columns']
+        print(f"Ensemble ML model v{ml_model_artifact.get('model_version', 'N/A')} loaded from {model_artifact_path}.")
     except FileNotFoundError:
-        print("ML model not found. The bot will run in signal-only mode without ML filtering.")
-        ml_model = None # Ensure it's None if loading fails
+        print(f"ML model not found at {model_artifact_path}. The bot will run in signal-only mode.")
+        ml_model_artifact = None
     except Exception as e:
         print(f"Error loading ML model: {e}. The bot will run in signal-only mode.")
-        ml_model = None
+        ml_model_artifact = None
 
     # Load symbols
     try:
@@ -1541,12 +1538,12 @@ async def main():
                         expected_r = 0
                         probabilities = [0,0,0]
                         # --- ML Model Integration ---
-                        if ml_model:
+                        if ml_model_artifact:
                             setup_info = {
                                 'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                                 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                             }
-                            prediction, probabilities = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
+                            prediction, probabilities = get_model_prediction(klines, setup_info, ml_model_artifact, ml_feature_columns)
                             expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
 
                             print(f"ML Model Prediction for {symbol} Short: Class {prediction}, "
@@ -1611,12 +1608,12 @@ async def main():
                         expected_r = 0
                         probabilities = [0,0,0]
                         # --- ML Model Integration ---
-                        if ml_model:
+                        if ml_model_artifact:
                             setup_info = {
                                 'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                                 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                             }
-                            prediction, probabilities = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
+                            prediction, probabilities = get_model_prediction(klines, setup_info, ml_model_artifact, ml_feature_columns)
                             expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
 
                             print(f"ML Model Prediction for {symbol} Long: Class {prediction}, "
