@@ -44,7 +44,7 @@ def is_session_valid(client):
         return False
 
 class TradeResult:
-    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels):
+    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels, probabilities=None, expected_r=None):
         self.symbol = symbol
         self.side = side
         self.entry_price = entry_price
@@ -58,6 +58,8 @@ class TradeResult:
         self.reason_for_entry = reason_for_entry
         self.reason_for_exit = reason_for_exit
         self.fib_levels = fib_levels
+        self.probabilities = probabilities
+        self.expected_r = expected_r
 
 def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price, sl, tp1, tp2):
     """
@@ -231,32 +233,47 @@ def get_fib_retracement(p1, p2, trend):
 
     return entry_price
 
-def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False):
+def calculate_quantity(client, symbol_info, risk_per_trade, sl_price, entry_price, leverage, risk_amount_usd=0, use_fixed_risk_amount=False, expected_r=0, min_expected_r=0.1, max_risk_scaling_factor=1.5, balance=None):
     """
-    Calculate the order quantity based on risk and leverage.
+    Calculate the order quantity based on risk, leverage, and dynamic sizing from Expected R.
     """
     try:
-        # Get account balance
-        account_info = client.futures_account()
-        balance = float(account_info['totalWalletBalance'])
+        # Get account balance for live trading, or use provided balance for backtesting
+        if balance is None:
+            account_info = client.futures_account()
+            balance = float(account_info['totalWalletBalance'])
 
-        # Calculate the maximum position size allowed by leverage
-        max_position_size = balance * leverage
+        # --- Dynamic Risk Scaling based on Expected R ---
+        size_multiplier = 1.0
+        if min_expected_r > 0: # Avoid division by zero
+            size_multiplier = min(expected_r / min_expected_r, max_risk_scaling_factor)
+        
+        # Ensure multiplier is not negative
+        size_multiplier = max(0, size_multiplier)
+        # ------------------------------------------------
 
-        # Calculate the desired position size based on risk
-        risk_amount = 0
+        # Calculate the base risk amount
+        base_risk_amount = 0
         if use_fixed_risk_amount:
-            risk_amount = risk_amount_usd
+            base_risk_amount = risk_amount_usd
         else:
-            risk_amount = balance * (risk_per_trade / 100)
+            base_risk_amount = balance * (risk_per_trade / 100)
+            
+        # Apply the scaling factor to get the final risk amount for this trade
+        final_risk_amount = base_risk_amount * size_multiplier
+
         sl_percentage = abs(entry_price - sl_price) / entry_price
         if sl_percentage == 0:
             return 0
 
-        trade_position_size = risk_amount / sl_percentage
+        # Calculate position size based on final risk amount
+        trade_position_size = final_risk_amount / sl_percentage
+        
+        # Calculate the maximum position size allowed by leverage
+        max_position_size_by_leverage = balance * leverage
 
         # Use the smaller of the two position sizes
-        final_position_size = min(trade_position_size, max_position_size)
+        final_position_size = min(trade_position_size, max_position_size_by_leverage)
 
         # Calculate quantity
         quantity = final_position_size / entry_price
@@ -455,7 +472,22 @@ def generate_csv_report(backtest_trades):
     """
     Generate a CSV report from the backtest results.
     """
-    df = pd.DataFrame([vars(t) for t in backtest_trades])
+    trades_data = []
+    for t in backtest_trades:
+        trade_dict = vars(t)
+        if t.probabilities is not None and len(t.probabilities) == 3:
+            trade_dict['p_loss'] = t.probabilities[0]
+            trade_dict['p_tp1'] = t.probabilities[1]
+            trade_dict['p_tp2'] = t.probabilities[2]
+        else:
+            trade_dict['p_loss'] = None
+            trade_dict['p_tp1'] = None
+            trade_dict['p_tp2'] = None
+        # Remove the original list to avoid confusion in CSV
+        trade_dict.pop('probabilities', None)
+        trades_data.append(trade_dict)
+        
+    df = pd.DataFrame(trades_data)
     df.to_csv('backtest/backtest_trades.csv', index=False)
     print("Backtest trades saved to backtest/backtest_trades.csv")
 
@@ -640,21 +672,43 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
 
     all_klines = {}
     for symbol in symbols:
-        print(f"Fetching historical data for {symbol}...")
-        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE,
-                              start_str=start_date.strftime("%Y-%m-%d %H:%M:%S"),
-                              end_str=end_date.strftime("%Y-%m-%d %H:%M:%S"))
+        # For backtesting, prioritize local dummy data to avoid API calls
+        dummy_path = f'data/raw/{symbol}/2025-01-01.parquet'
+        if symbol == 'BTCUSDT' and os.path.exists(dummy_path):
+            print(f"Loading local dummy data for {symbol} from {dummy_path}")
+            df = pd.read_parquet(dummy_path)
+            # Convert DataFrame to the list-of-lists format expected by the rest of the backtester
+            klines = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].values.tolist()
+        else:
+            print(f"Fetching historical data for {symbol}...")
+            if client is None:
+                print(f"  - Skipping {symbol} because client is not available.")
+                continue
+            klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE,
+                                  start_str=start_date.strftime("%Y-%m-%d %H:%M:%S"),
+                                  end_str=end_date.strftime("%Y-%m-%d %H:%M:%S"))
+        
         if klines:
             all_klines[symbol] = klines
             # --- ML Data Generation ---
-            print(f"  - Saving data for ML pipeline for {symbol}...")
-            ML.process_and_save_kline_data(klines, symbol)
+            # This part is for generating training data, not strictly part of the backtest logic itself
+            # print(f"  - Saving data for ML pipeline for {symbol}...")
+            # ML.process_and_save_kline_data(klines, symbol)
             # --------------------------
 
     print("Backtest data fetched.")
 
     backtest_trades = []
     balance = config['starting_balance']
+
+    if symbols_info is None:
+        print("symbols_info not available. Creating dummy info for BTCUSDT for backtesting.")
+        symbols_info = {
+            'BTCUSDT': {
+                'symbol': 'BTCUSDT', 'pricePrecision': 2, 'quantityPrecision': 3,
+                'filters': [{'filterType': 'LOT_SIZE', 'stepSize': '0.001'}]
+            }
+        }
 
     for symbol in all_klines:
         print(f"Backtesting {symbol}...")
@@ -672,19 +726,25 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 tp1 = entry_price - (sl - entry_price)
                 tp2 = entry_price - (sl - entry_price) * 2
 
+                expected_r = 0
                 if ml_model:
                     setup_info = {
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                     }
-                    prediction, _ = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
-                    if prediction == 0:
+                    prediction, probabilities = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
+                    expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
+                    
+                    if expected_r < config.get('min_expected_r', 0.1):
                         continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
                     entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'])
+                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'],
+                                                  expected_r=expected_r, min_expected_r=config.get('min_expected_r', 0.1),
+                                                  max_risk_scaling_factor=config.get('max_risk_scaling_factor', 1.5),
+                                                  balance=balance)
                     if quantity is None or quantity == 0:
                         continue
 
@@ -732,7 +792,9 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         drawdown=0, # Simplified for now
                         reason_for_entry=f"Fib retracement in downtrend",
                         reason_for_exit=reason_for_exit,
-                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
+                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0], # Simplified for now
+                        probabilities=probabilities.tolist() if 'probabilities' in locals() else None,
+                        expected_r=expected_r
                     )
                     trade.balance = balance
                     backtest_trades.append(trade)
@@ -746,19 +808,25 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 tp1 = entry_price + (entry_price - last_swing_low)
                 tp2 = entry_price + (entry_price - last_swing_low) * 2
 
+                expected_r = 0
                 if ml_model:
                     setup_info = {
                         'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                         'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                     }
-                    prediction, _ = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
-                    if prediction == 0:
+                    prediction, probabilities = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
+                    expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
+
+                    if expected_r < config.get('min_expected_r', 0.1):
                         continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
                     entry_timestamp = current_klines[-1][0]
-                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'])
+                    quantity = calculate_quantity(client, symbols_info[symbol], config['risk_per_trade'], sl, entry_price, config['leverage'],
+                                                  expected_r=expected_r, min_expected_r=config.get('min_expected_r', 0.1),
+                                                  max_risk_scaling_factor=config.get('max_risk_scaling_factor', 1.5),
+                                                  balance=balance)
                     if quantity is None or quantity == 0:
                         continue
 
@@ -806,7 +874,9 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                         drawdown=0, # Simplified for now
                         reason_for_entry=f"Fib retracement in uptrend",
                         reason_for_exit=reason_for_exit,
-                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
+                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0], # Simplified for now
+                        probabilities=probabilities.tolist() if 'probabilities' in locals() else None,
+                        expected_r=expected_r
                     )
                     trade.balance = balance
                     backtest_trades.append(trade)
@@ -1177,9 +1247,30 @@ ml_model = None
 ml_feature_columns = None
 model_confidence_threshold = 0.7 # Default value
 
+def calculate_expected_r(probabilities, entry_price, sl, tp1, tp2):
+    """
+    Calculates the Expected R (edge) of a trade.
+    """
+    if probabilities is None or len(probabilities) < 3:
+        return 0
+
+    p_loss, p_tp1, p_tp2 = probabilities[0], probabilities[1], probabilities[2]
+
+    # Calculate reward multiples (R-values)
+    risk_per_share = abs(entry_price - sl)
+    if risk_per_share == 0:
+        return 0
+
+    tp1_r = abs(tp1 - entry_price) / risk_per_share
+    tp2_r = abs(tp2 - entry_price) / risk_per_share
+
+    # Calculate Expected R
+    expected_r = (p_tp1 * tp1_r) + (p_tp2 * tp2_r) - (p_loss * 1) # Risk is 1R
+    return expected_r
+
 def get_model_prediction(klines, setup_info, model, feature_columns):
     """
-    Generates features for a live setup and gets a prediction from the ML model.
+    Generates features for a live setup and gets a prediction and probability vector from the ML model.
     """
     # Convert klines to a DataFrame for the feature generation function
     klines_df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
@@ -1192,9 +1283,8 @@ def get_model_prediction(klines, setup_info, model, feature_columns):
     # Make prediction
     prediction = model.predict(feature_vector)[0]
     probabilities = model.predict_proba(feature_vector)[0]
-    confidence = probabilities[prediction]
     
-    return prediction, confidence
+    return prediction, probabilities
 
 
 def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
@@ -1234,7 +1324,11 @@ async def main():
         starting_balance = int(config['starting_balance'])
         chart_image_candles = int(config['chart_image_candles'])
         max_open_positions = int(config['max_open_positions'])
-        model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # Use .get for safe access
+        model_confidence_threshold = config.get('model_confidence_threshold', 0.7) # DEPRECATED
+        min_expected_r = config.get('min_expected_r', 0.15) # New threshold
+        max_risk_scaling_factor = config.get('max_risk_scaling_factor', 1.5) # New sizing cap
+        min_p2_confidence = config.get('min_p2_confidence', 0.3) # New rule
+        max_p0_confidence = config.get('max_p0_confidence', 0.4) # New rule
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -1246,9 +1340,9 @@ async def main():
     # Load the ML model
     try:
         model_data = joblib.load('models/trading_model.joblib')
-        ml_model = model_data['model']
+        ml_model = model_data['calibrated_model'] # Use the explicitly named calibrated model
         ml_feature_columns = model_data['feature_columns']
-        print(f"ML model loaded. Signal confidence threshold is {model_confidence_threshold * 100}%.")
+        print(f"Calibrated ML model v{model_data.get('model_version', 'N/A')} loaded. Min Expected R threshold is {min_expected_r}.")
     except FileNotFoundError:
         print("ML model not found. The bot will run in signal-only mode without ML filtering.")
         ml_model = None # Ensure it's None if loading fails
@@ -1327,14 +1421,15 @@ async def main():
             print("Backtest will run without quantity calculation if symbols_info is not available.")
 
 
-    # Start the Telegram bot
-    def run_bot():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(application.run_polling())
+    # Start the Telegram bot only if not in backtest mode
+    if not backtest_mode:
+        def run_bot():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(application.run_polling())
 
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+        bot_thread = threading.Thread(target=run_bot, daemon=True)
+        bot_thread.start()
 
     # Load trades from JSON
     if not backtest_mode and os.path.exists('trades.json'):
@@ -1442,32 +1537,50 @@ async def main():
                         sl = last_swing_high
                         tp1 = entry_price - (sl - entry_price)
                         tp2 = entry_price - (sl - entry_price) * 2
-
+                        
+                        expected_r = 0
+                        probabilities = [0,0,0]
                         # --- ML Model Integration ---
                         if ml_model:
                             setup_info = {
                                 'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                                 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
                             }
-                            prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
-                            
-                            print(f"ML Model Prediction for {symbol} Short: Class {prediction} with {confidence:.2f}% confidence.")
+                            prediction, probabilities = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
+                            expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
 
-                            if prediction == 0 or confidence < model_confidence_threshold:
-                                print(f"  - ML Model REJECTED signal. Reason: Prediction={prediction}, Confidence={confidence:.2f}")
-                                rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spam
-                                continue # Skip to next symbol
+                            print(f"ML Model Prediction for {symbol} Short: Class {prediction}, "
+                                  f"P(L, T1, T2): ({probabilities[0]:.2f}, {probabilities[1]:.2f}, {probabilities[2]:.2f}), "
+                                  f"Expected R: {expected_r:.3f}")
                             
-                            print("  - ML Model ACCEPTED signal.")
+                            rejection_reason = ""
+                            if expected_r < min_expected_r:
+                                rejection_reason = f"Expected R ({expected_r:.3f}) < {min_expected_r}"
+                            elif probabilities[2] < min_p2_confidence:
+                                rejection_reason = f"P(TP2) ({probabilities[2]:.3f}) < {min_p2_confidence}"
+                            elif probabilities[0] > max_p0_confidence:
+                                rejection_reason = f"P(Loss) ({probabilities[0]:.3f}) > {max_p0_confidence}"
+
+                            if rejection_reason:
+                                print(f"  - ML Model REJECTED signal. Reason: {rejection_reason}")
+                                # Optional: Log rejection to Telegram for monitoring
+                                # await send_telegram_alert(bot, f"📈 REJECTED {symbol} Short\nReason: {rejection_reason}")
+                                rejected_symbols[symbol] = time.time()
+                                continue
+                            
+                            print(f"  - ML Model ACCEPTED signal. Expected R: {expected_r:.3f}")
                         # --------------------------
 
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, 
+                                                      risk_amount_usd, use_fixed_risk_amount,
+                                                      expected_r=expected_r, min_expected_r=min_expected_r,
+                                                      max_risk_scaling_factor=max_risk_scaling_factor)
                         if quantity is None or quantity == 0:
                             continue
 
-                        prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
-                        ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
+                        ml_info = (f"🧠 P(Loss, TP1, TP2): ({probabilities[0]:.1%}, {probabilities[1]:.1%}, {probabilities[2]:.1%})\n"
+                                   f"📈 Expected R: {expected_r:.3f}")
                         
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
@@ -1476,7 +1589,7 @@ async def main():
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
+                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'probabilities': probabilities.tolist(), 'expected_r': expected_r}
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
@@ -1495,31 +1608,47 @@ async def main():
                         tp1 = entry_price + (entry_price - last_swing_low)
                         tp2 = entry_price + (entry_price - last_swing_low) * 2
 
+                        expected_r = 0
+                        probabilities = [0,0,0]
                         # --- ML Model Integration ---
                         if ml_model:
                             setup_info = {
                                 'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
                                 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
                             }
-                            prediction, confidence = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
-                            
-                            print(f"ML Model Prediction for {symbol} Long: Class {prediction} with {confidence:.2f}% confidence.")
+                            prediction, probabilities = get_model_prediction(klines, setup_info, ml_model, ml_feature_columns)
+                            expected_r = calculate_expected_r(probabilities, entry_price, sl, tp1, tp2)
 
-                            if prediction == 0 or confidence < model_confidence_threshold:
-                                print(f"  - ML Model REJECTED signal. Reason: Prediction={prediction}, Confidence={confidence:.2f}")
+                            print(f"ML Model Prediction for {symbol} Long: Class {prediction}, "
+                                  f"P(L, T1, T2): ({probabilities[0]:.2f}, {probabilities[1]:.2f}, {probabilities[2]:.2f}), "
+                                  f"Expected R: {expected_r:.3f}")
+                            
+                            rejection_reason = ""
+                            if expected_r < min_expected_r:
+                                rejection_reason = f"Expected R ({expected_r:.3f}) < {min_expected_r}"
+                            elif probabilities[2] < min_p2_confidence:
+                                rejection_reason = f"P(TP2) ({probabilities[2]:.3f}) < {min_p2_confidence}"
+                            elif probabilities[0] > max_p0_confidence:
+                                rejection_reason = f"P(Loss) ({probabilities[0]:.3f}) > {max_p0_confidence}"
+                            
+                            if rejection_reason:
+                                print(f"  - ML Model REJECTED signal. Reason: {rejection_reason}")
                                 rejected_symbols[symbol] = time.time()
                                 continue
                             
-                            print("  - ML Model ACCEPTED signal.")
+                            print(f"  - ML Model ACCEPTED signal. Expected R: {expected_r:.3f}")
                         # --------------------------
 
                         symbol_info = symbols_info[symbol]
-                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage, risk_amount_usd, use_fixed_risk_amount)
+                        quantity = calculate_quantity(client, symbol_info, risk_per_trade, sl, entry_price, leverage,
+                                                      risk_amount_usd, use_fixed_risk_amount,
+                                                      expected_r=expected_r, min_expected_r=min_expected_r,
+                                                      max_risk_scaling_factor=max_risk_scaling_factor)
                         if quantity is None or quantity == 0:
                             continue
 
-                        prediction_map = {0: "Loss", 1: "TP1 Win", 2: "TP2 Win"}
-                        ml_info = f"🧠 ML Prediction: {prediction_map.get(prediction, 'Unknown')} (Conf: {confidence:.1%})"
+                        ml_info = (f"🧠 P(Loss, TP1, TP2): ({probabilities[0]:.1%}, {probabilities[1]:.1%}, {probabilities[2]:.1%})\n"
+                                   f"📈 Expected R: {expected_r:.3f}")
 
                         image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
                         caption = (f"🚀 NEW TRADE SIGNAL (ML ACCEPTED) 🚀\n{ml_info}\n\n"
@@ -1528,7 +1657,7 @@ async def main():
                                    f"Stop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}")
                         await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None}
+                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'status': 'pending', 'quantity': quantity, 'timestamp': klines[-1][0], 'sl_order_id': None, 'tp_order_id': None, 'probabilities': probabilities.tolist(), 'expected_r': expected_r}
                         with trades_lock:
                             trades.append(new_trade)
                         virtual_orders[symbol] = new_trade
