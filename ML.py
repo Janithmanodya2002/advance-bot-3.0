@@ -601,17 +601,30 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
     # Use a copy to avoid modifying the original DataFrame
     df = klines_df.copy()
 
-    # --- Pre-calculate indicators on the DataFrame ---
+    # --- Pre-calculate all indicators on the DataFrame ---
     df['atr'] = calculate_atr(df)
     df['rsi'] = calculate_rsi(df)
     df['macd'], df['macd_signal'] = calculate_macd(df)
-    df['rolling_volatility'] = df['close'].pct_change().rolling(window=20).std()
+    df['adx'] = calculate_adx(df)
+    df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
+    df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
+    for p in [20, 50, 100]:
+        df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
     df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
 
-    # Get the most recent candle for context features
-    # The timestamp of the setup is the last candle in the klines_df
-    setup_candle_timestamp = df.iloc[-1]['timestamp']
-    setup_candle = df.iloc[-1]
+    # Create a datetime index for resampling
+    df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
+
+    # Higher-timeframe features (4-hour)
+    df_4h = df['close'].resample('4h').ohlc()
+    df_4h['rsi'] = calculate_rsi(df_4h)
+    df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
+    df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
+    
+    # --- Get the correct candles for feature extraction ---
+    setup_candle_timestamp_dt = df.index[-1]
+    setup_candle = df.loc[setup_candle_timestamp_dt]
+    htf_candle = df_4h.asof(setup_candle_timestamp_dt)
 
     # --- Calculate Features ---
     features = {}
@@ -628,13 +641,19 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
         features['tp1_pct'] = abs(setup_info['tp1'] - setup_info['entry_price']) / swing_height
         features['tp2_pct'] = abs(setup_info['tp2'] - setup_info['entry_price']) / swing_height
     else:
+        # Assign np.nan to avoid division by zero and ensure consistent feature count
         features['golden_zone_ratio'] = np.nan
         features['sl_pct'] = np.nan
         features['tp1_pct'] = np.nan
         features['tp2_pct'] = np.nan
 
+    # Price Action Feature
+    candle_range = setup_candle['high'] - setup_candle['low']
+    candle_body = abs(setup_candle['open'] - setup_candle['close'])
+    features['body_to_range_ratio'] = candle_body / candle_range if candle_range > 0 else 0
+
     # Session One-Hot Encoding
-    session_str = get_session(setup_candle_timestamp)
+    session_str = get_session(setup_candle['timestamp'])
     features['is_asia'] = 1 if 'Asia' in session_str else 0
     features['is_london'] = 1 if 'London' in session_str else 0
     features['is_new_york'] = 1 if 'New_York' in session_str else 0
@@ -643,16 +662,35 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
     features['atr'] = setup_candle['atr']
     features['rsi'] = setup_candle['rsi']
     features['macd_diff'] = setup_candle['macd'] - setup_candle['macd_signal']
-    features['rolling_volatility'] = setup_candle['rolling_volatility']
-        
+    features['adx'] = setup_candle['adx']
+    for p in [20, 50, 100]:
+        features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
+    
+    # Bollinger Bands
+    features['bb_upper'] = setup_candle['bb_upper']
+    features['bb_lower'] = setup_candle['bb_lower']
+
+    # Ichimoku Cloud
+    features['tenkan_sen'] = setup_candle['tenkan_sen']
+    features['kijun_sen'] = setup_candle['kijun_sen']
+    features['senkou_span_a'] = setup_candle['senkou_span_a']
+    features['senkou_span_b'] = setup_candle['senkou_span_b']
+    features['chikou_span'] = setup_candle['chikou_span']
+
+    # Higher-Timeframe Context
+    features['rsi_4h'] = htf_candle['rsi']
+    features['macd_diff_4h'] = htf_candle['macd_diff']
+
     # Symbol-Level Features
     features['liquidity_proxy'] = setup_candle['liquidity_proxy']
-
+    
     # Side feature
     features['side_long'] = 1 if setup_info['side'] == 'long' else 0
 
-    # Create a DataFrame with the correct column order
-    feature_vector = pd.DataFrame([features], columns=feature_columns)
+    # Create a DataFrame with the correct column order and handle potential NaNs
+    feature_vector = pd.DataFrame([features])
+    feature_vector = feature_vector[feature_columns] # Ensure column order
+    feature_vector.fillna(0, inplace=True) # Fill any potential NaNs with 0 as a safe default
     
     return feature_vector
 
@@ -716,52 +754,31 @@ def train_model():
     print(f"Calculated class weights: {weights_dict}")
     sample_weights = y_train.map(weights_dict)
 
-    # --- Hyperparameter Tuning with RandomizedSearchCV ---
-    # Define the parameter grid for LightGBM
-    param_grid = {
-        'num_leaves': [31, 50, 70],
-        'max_depth': [-1, 10, 20],
-        'learning_rate': [0.01, 0.05, 0.1],
-        'n_estimators': [100, 200, 300],
-        'subsample': [0.7, 0.8, 0.9],
-        'colsample_bytree': [0.7, 0.8, 0.9],
-        'reg_alpha': [0.1, 0.5],
-        'reg_lambda': [0.1, 0.5]
+    # --- Model Training with User-Defined Parameters ---
+    # Parameters provided by the user
+    user_params = {
+        'subsample': 0.7, 
+        'reg_lambda': 0.5, 
+        'reg_alpha': 0.1, 
+        'num_leaves': 70, 
+        'n_estimators': 300, 
+        'max_depth': -1, 
+        'learning_rate': 0.1, 
+        'colsample_bytree': 0.9,
+        'objective': 'multiclass',
+        'num_class': 3,
+        'n_jobs': -1,
+        'random_state': 42 # for reproducibility
     }
 
-    # Initialize LightGBM Classifier
-    model = lgb.LGBMClassifier(
-        objective='multiclass',
-        num_class=3,
-        n_jobs=-1  # Enable multithreading
-    )
+    print(f"Training model with user-defined parameters: {user_params}")
 
-    # Use TimeSeriesSplit for cross-validation to respect the chronological order of data
-    tscv = TimeSeriesSplit(n_splits=3)
-    
-    # Using RandomizedSearchCV for faster tuning
-    random_search = RandomizedSearchCV(
-        estimator=model,
-        param_distributions=param_grid,
-        n_iter=300,  # Number of parameter settings that are sampled
-        scoring='f1_weighted',
-        cv=tscv,
-        verbose=2, # Will show progress for each fold
-        n_jobs=-1, # Use all available cores
-        random_state=42 # for reproducibility
-    )
-
-    print("Starting hyperparameter search with RandomizedSearchCV...")
-    random_search.fit(X_train, y_train, sample_weight=sample_weights)
-
-    print(f"\nBest parameters found: {random_search.best_params_}")
-    print(f"Best f1_weighted score: {random_search.best_score_}")
-
-    # Get the best model
-    best_model = random_search.best_estimator_
+    # Initialize and train the LightGBM Classifier
+    best_model = lgb.LGBMClassifier(**user_params)
+    best_model.fit(X_train, y_train, sample_weight=sample_weights)
 
     # --- Evaluation ---
-    print("\nModel Evaluation on Test Set with Best Estimator:")
+    print("\nModel Evaluation on Test Set:")
     y_pred = best_model.predict(X_test)
     
     # Add labels parameter to handle cases where test data doesn't have all classes
