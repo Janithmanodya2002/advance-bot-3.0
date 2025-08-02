@@ -5,7 +5,7 @@ import pytz
 from datetime import datetime
 import pyarrow as pa
 import pyarrow.parquet as pq
-from binance.client import Client
+from binance.client import Client as BinanceClient
 import glob
 import keys
 
@@ -27,7 +27,7 @@ SESSIONS = {
 
 # --- Data Acquisition (Step 1) ---
 
-def fetch_historical(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, total_limit=20000):
+def fetch_historical(client, symbol, interval=BinanceClient.KLINE_INTERVAL_15MINUTE, total_limit=20000):
     """
     Fetches historical klines from Binance, handling pagination to get more data.
     """
@@ -74,7 +74,7 @@ def fetch_initial_data():
         print(f"Error: {SYMBOLS_FILE} not found.")
         return
 
-    client = Client(keys.api_mainnet, keys.secret_mainnet)
+    client = BinanceClient(keys.api_mainnet, keys.secret_mainnet)
     
     for symbol in symbols:
         print(f"Fetching data for {symbol}...")
@@ -227,7 +227,8 @@ def find_and_label_setups(df):
     """Finds all potential trade setups and labels them."""
     labeled_setups = []
 
-    for i in range(LOOKBACK_CANDLES, len(df) - TRADE_EXPIRY_BARS):
+    # Adding tqdm for a progress bar
+    for i in tqdm(range(LOOKBACK_CANDLES, len(df) - TRADE_EXPIRY_BARS), desc="Finding Setups"):
         if df['session'].iloc[i] == 'Inactive':
             continue
 
@@ -402,6 +403,39 @@ def calculate_adx(df, period=14):
     
     return adx.fillna(0) # Return ADX, fill initial NaNs with 0
 
+def calculate_bollinger_bands(df, window=20, num_std_dev=2):
+    """Calculates Bollinger Bands."""
+    rolling_mean = df['close'].rolling(window=window).mean()
+    rolling_std = df['close'].rolling(window=window).std()
+    upper_band = rolling_mean + (rolling_std * num_std_dev)
+    lower_band = rolling_mean - (rolling_std * num_std_dev)
+    return upper_band, lower_band
+
+def calculate_ichimoku_cloud(df):
+    """Calculates Ichimoku Cloud components."""
+    # Tenkan-sen (Conversion Line)
+    tenkan_sen_high = df['high'].rolling(window=9).max()
+    tenkan_sen_low = df['low'].rolling(window=9).min()
+    tenkan_sen = (tenkan_sen_high + tenkan_sen_low) / 2
+
+    # Kijun-sen (Base Line)
+    kijun_sen_high = df['high'].rolling(window=26).max()
+    kijun_sen_low = df['low'].rolling(window=26).min()
+    kijun_sen = (kijun_sen_high + kijun_sen_low) / 2
+
+    # Senkou Span A (Leading Span A)
+    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
+
+    # Senkou Span B (Leading Span B)
+    senkou_span_b_high = df['high'].rolling(window=52).max()
+    senkou_span_b_low = df['low'].rolling(window=52).min()
+    senkou_span_b = ((senkou_span_b_high + senkou_span_b_low) / 2).shift(26)
+
+    # Chikou Span (Lagging Span)
+    chikou_span = df['close'].shift(-26)
+
+    return tenkan_sen, kijun_sen, senkou_span_a, senkou_span_b, chikou_span
+
 def engineer_features():
     """Loads labeled trades and engineers features for the ML model."""
     print("Starting feature engineering...")
@@ -422,6 +456,8 @@ def engineer_features():
             df['rsi'] = calculate_rsi(df)
             df['macd'], df['macd_signal'] = calculate_macd(df)
             df['adx'] = calculate_adx(df) # New trend strength feature
+            df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
+            df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
             
             # New multi-period volatility features
             for p in [20, 50, 100]:
@@ -516,6 +552,17 @@ def engineer_features():
         for p in [20, 50, 100]:
             features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
         
+        # Bollinger Bands
+        features['bb_upper'] = setup_candle['bb_upper']
+        features['bb_lower'] = setup_candle['bb_lower']
+
+        # Ichimoku Cloud
+        features['tenkan_sen'] = setup_candle['tenkan_sen']
+        features['kijun_sen'] = setup_candle['kijun_sen']
+        features['senkou_span_a'] = setup_candle['senkou_span_a']
+        features['senkou_span_b'] = setup_candle['senkou_span_b']
+        features['chikou_span'] = setup_candle['chikou_span']
+
         # Higher-Timeframe Context
         features['rsi_4h'] = htf_candle['rsi']
         features['macd_diff_4h'] = htf_candle['macd_diff']
@@ -610,13 +657,14 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
     return feature_vector
 
 
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
+import joblib
+from tqdm.auto import tqdm
+
+import lightgbm as lgb
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
-import joblib
 
-from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 
 # --- Model Training (Step 4) ---
 def train_model():
@@ -642,7 +690,9 @@ def train_model():
         'body_to_range_ratio',
         'adx',
         'volatility_20', 'volatility_50', 'volatility_100',
-        'rsi_4h', 'macd_diff_4h'
+        'rsi_4h', 'macd_diff_4h',
+        'bb_upper', 'bb_lower',
+        'tenkan_sen', 'kijun_sen', 'senkou_span_a', 'senkou_span_b', 'chikou_span'
     ]
     features_df['side_long'] = (features_df['side'] == 'long').astype(int)
     feature_columns.append('side_long')
@@ -666,47 +716,49 @@ def train_model():
     print(f"Calculated class weights: {weights_dict}")
     sample_weights = y_train.map(weights_dict)
 
-    # --- Hyperparameter Tuning with GridSearchCV ---
-    # Define an expanded parameter grid to search.
+    # --- Hyperparameter Tuning with RandomizedSearchCV ---
+    # Define the parameter grid for LightGBM
     param_grid = {
-        'max_depth': [3, 5, 7, 9],
+        'num_leaves': [31, 50, 70],
+        'max_depth': [-1, 10, 20],
         'learning_rate': [0.01, 0.05, 0.1],
         'n_estimators': [100, 200, 300],
         'subsample': [0.7, 0.8, 0.9],
-        'colsample_bytree': [0.7, 0.8, 0.9], # Feature subsampling
-        'gamma': [0, 0.1, 0.2] # Regularization
+        'colsample_bytree': [0.7, 0.8, 0.9],
+        'reg_alpha': [0.1, 0.5],
+        'reg_lambda': [0.1, 0.5]
     }
 
-    # Initialize XGBoost Classifier
-    # n_jobs=-1 uses all available CPU cores for training
-    model = xgb.XGBClassifier(
-        objective='multi:softmax',
+    # Initialize LightGBM Classifier
+    model = lgb.LGBMClassifier(
+        objective='multiclass',
         num_class=3,
-        use_label_encoder=False,
-        eval_metric='mlogloss',
         n_jobs=-1  # Enable multithreading
     )
 
-    # Initialize GridSearchCV
     # Use TimeSeriesSplit for cross-validation to respect the chronological order of data
     tscv = TimeSeriesSplit(n_splits=3)
-    grid_search = GridSearchCV(
+    
+    # Using RandomizedSearchCV for faster tuning
+    random_search = RandomizedSearchCV(
         estimator=model,
-        param_grid=param_grid,
+        param_distributions=param_grid,
+        n_iter=300,  # Number of parameter settings that are sampled
         scoring='f1_weighted',
         cv=tscv,
-        verbose=1,
-        n_jobs=-1 # Use all available cores for grid search
+        verbose=2, # Will show progress for each fold
+        n_jobs=-1, # Use all available cores
+        random_state=42 # for reproducibility
     )
 
-    print("Starting hyperparameter search with GridSearchCV...")
-    grid_search.fit(X_train, y_train, sample_weight=sample_weights)
+    print("Starting hyperparameter search with RandomizedSearchCV...")
+    random_search.fit(X_train, y_train, sample_weight=sample_weights)
 
-    print(f"\nBest parameters found: {grid_search.best_params_}")
-    print(f"Best f1_weighted score: {grid_search.best_score_}")
+    print(f"\nBest parameters found: {random_search.best_params_}")
+    print(f"Best f1_weighted score: {random_search.best_score_}")
 
     # Get the best model
-    best_model = grid_search.best_estimator_
+    best_model = random_search.best_estimator_
 
     # --- Evaluation ---
     print("\nModel Evaluation on Test Set with Best Estimator:")
