@@ -1196,6 +1196,14 @@ def get_model_prediction(klines, setup_info, model, feature_columns):
     
     return prediction, confidence
 
+
+def start_order_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode):
+    """Wrapper to run the async order_status_monitor in a separate thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode))
+
+
 async def main():
     """
     Main function to run the Binance trading bot.
@@ -1342,7 +1350,7 @@ async def main():
                 pass
 
     if not backtest_mode:
-        monitor_thread = threading.Thread(target=order_status_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
+        monitor_thread = threading.Thread(target=start_order_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
         monitor_thread.start()
 
     if backtest_mode:
