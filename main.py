@@ -621,6 +621,20 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
     Run the backtesting simulation and generate data for the ML model.
     """
     print("Starting backtest...")
+
+    # Load the ML model
+    try:
+        model_data = joblib.load('models/trading_model.joblib')
+        ml_model = model_data['model']
+        ml_feature_columns = model_data['feature_columns']
+        print("ML model loaded for backtesting.")
+    except FileNotFoundError:
+        print("ML model not found. Backtest will run without ML filtering.")
+        ml_model = None
+    except Exception as e:
+        print(f"Error loading ML model: {e}. Backtest will run without ML filtering.")
+        ml_model = None
+
     end_date = datetime.datetime.now(pytz.utc)
     start_date = end_date - datetime.timedelta(days=days_to_backtest)
 
@@ -656,6 +670,16 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
                 sl = last_swing_high
                 tp1 = entry_price - (sl - entry_price)
+                tp2 = entry_price - (sl - entry_price) * 2
+
+                if ml_model:
+                    setup_info = {
+                        'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
+                        'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'short'
+                    }
+                    prediction, _ = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
+                    if prediction == 0:
+                        continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) > entry_price:
@@ -720,6 +744,16 @@ def run_backtest(client, symbols, days_to_backtest, config, symbols_info):
                 entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
                 sl = last_swing_low
                 tp1 = entry_price + (entry_price - last_swing_low)
+                tp2 = entry_price + (entry_price - last_swing_low) * 2
+
+                if ml_model:
+                    setup_info = {
+                        'swing_high_price': last_swing_high, 'swing_low_price': last_swing_low,
+                        'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'side': 'long'
+                    }
+                    prediction, _ = get_model_prediction([dict(zip(['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'], k)) for k in current_klines], setup_info, ml_model, ml_feature_columns)
+                    if prediction == 0:
+                        continue
 
                 # Simulate trade entry
                 if float(current_klines[-1][4]) < entry_price:
@@ -1307,8 +1341,9 @@ async def main():
             except json.JSONDecodeError:
                 pass
 
-    monitor_thread = threading.Thread(target=run_monitor, args=(backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
-    monitor_thread.start()
+    if not backtest_mode:
+        monitor_thread = threading.Thread(target=order_status_monitor, args=(client, application, backtest_mode, live_mode, symbols_info, is_hedge_mode), daemon=True)
+        monitor_thread.start()
 
     if backtest_mode:
         backtest_trades = run_backtest(client, symbols, days_to_backtest, config, symbols_info)
