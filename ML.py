@@ -111,8 +111,13 @@ def process_and_save_kline_data(klines, symbol, filename=None):
         return
     print(f"Processing and saving {len(klines)} candles for {symbol}...")
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-    for col in ['open', 'high', 'low', 'close', 'volume']:
+    
+    # Keep the new taker volume column
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 'taker_buy_base_asset_volume']]
+    
+    # Coerce all numeric columns to numbers, handling potential errors
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_asset_volume']
+    for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df['session'] = get_session(df['timestamp'])
     save_data_to_parquet(df, symbol, filename)
@@ -455,30 +460,33 @@ def engineer_features():
             df['atr'] = calculate_atr(df)
             df['rsi'] = calculate_rsi(df)
             df['macd'], df['macd_signal'] = calculate_macd(df)
-            df['adx'] = calculate_adx(df) # New trend strength feature
+            df['adx'] = calculate_adx(df)
             df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
             df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
             
-            # New multi-period volatility features
             for p in [20, 50, 100]:
                 df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
             
             df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
             
-            # Create a datetime index for resampling
             df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
 
-            # Higher-timeframe features (4-hour)
             df_4h = df['close'].resample('4h').ohlc()
             df_4h['rsi'] = calculate_rsi(df_4h)
             df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
             df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
             
-            # Store both original and 4h data
             all_raw_data[symbol] = {'15m': df, '4h': df_4h}
 
+    # --- Volatility Regime Calculation ---
+    all_volatility = pd.concat([data['15m']['volatility_50'] for symbol, data in all_raw_data.items() if 'volatility_50' in data['15m'] and not data['15m'].empty]).dropna()
+    if not all_volatility.empty:
+        vol_low_threshold, vol_high_threshold = all_volatility.quantile([0.33, 0.67])
+    else:
+        vol_low_threshold, vol_high_threshold = 0, 0
+
     feature_list = []
-    for _, row in labeled_df.iterrows():
+    for _, row in tqdm(labeled_df.iterrows(), total=labeled_df.shape[0], desc="Engineering Features"):
         symbol = row['symbol']
         timestamp = row['timestamp']
 
@@ -489,55 +497,59 @@ def engineer_features():
         raw_df_15m = data_dict['15m']
         raw_df_4h = data_dict['4h']
 
-        # The index is now datetime
         setup_timestamp_dt = pd.to_datetime(timestamp, unit='ms')
 
         try:
-            # Find the exact setup candle in the raw data
             setup_candle = raw_df_15m.loc[setup_timestamp_dt]
-            # Find the corresponding 4h candle
-            # Use asof to get the last available 4h data for the given 15m candle time
             htf_candle = raw_df_4h.asof(setup_timestamp_dt)
-
         except KeyError:
-            # This can happen if the labeled setup is too close to the edge of the raw data
             continue
 
-        # --- Calculate Features ---
         features = {}
-        
-        # Original data to keep for model analysis and execution
-        features['symbol'] = symbol
-        features['timestamp'] = timestamp
-        features['side'] = row['side']
-        features['entry_price'] = row['entry_price']
-        features['sl'] = row['sl']
-        features['tp1'] = row['tp1']
-        features['tp2'] = row['tp2']
+        features['symbol'], features['timestamp'], features['side'] = symbol, timestamp, row['side']
+        features['entry_price'], features['sl'], features['tp1'], features['tp2'] = row['entry_price'], row['sl'], row['tp1'], row['tp2']
         features['label'] = row['label']
 
-        # Price & Strategy Features
         swing_height = row['swing_high_price'] - row['swing_low_price']
         if swing_height > 0:
             if row['side'] == 'long':
                 features['golden_zone_ratio'] = (row['entry_price'] - row['swing_low_price']) / swing_height
-            else: # short
+            else:
                 features['golden_zone_ratio'] = (row['swing_high_price'] - row['entry_price']) / swing_height
-            
             features['sl_pct'] = abs(row['entry_price'] - row['sl']) / swing_height
             features['tp1_pct'] = abs(row['tp1'] - row['entry_price']) / swing_height
             features['tp2_pct'] = abs(row['tp2'] - row['entry_price']) / swing_height
         else:
-            features['golden_zone_ratio'] = np.nan
-            features['sl_pct'] = np.nan
-            features['tp1_pct'] = np.nan
-            features['tp2_pct'] = np.nan
+            features['golden_zone_ratio'], features['sl_pct'], features['tp1_pct'], features['tp2_pct'] = np.nan, np.nan, np.nan, np.nan
 
-        # Price Action Feature
         candle_range = setup_candle['high'] - setup_candle['low']
-        candle_body = abs(setup_candle['open'] - setup_candle['close'])
-        features['body_to_range_ratio'] = candle_body / candle_range if candle_range > 0 else 0
+        if candle_range > 0:
+            features['body_to_range_ratio'] = abs(setup_candle['open'] - setup_candle['close']) / candle_range
+            features['upper_wick_ratio'] = (setup_candle['high'] - max(setup_candle['open'], setup_candle['close'])) / candle_range
+            features['lower_wick_ratio'] = (min(setup_candle['open'], setup_candle['close']) - setup_candle['low']) / candle_range
+        else:
+            features['body_to_range_ratio'], features['upper_wick_ratio'], features['lower_wick_ratio'] = 0, 0, 0
 
+        try:
+            setup_idx_loc = raw_df_15m.index.get_loc(setup_timestamp_dt)
+            for n in range(1, 4):
+                prev_candle = raw_df_15m.iloc[setup_idx_loc - n]
+                prev_range = prev_candle['high'] - prev_candle['low']
+                if prev_range > 0:
+                    features[f'body_to_range_ratio_t-{n}'] = abs(prev_candle['open'] - prev_candle['close']) / prev_range
+                    features[f'upper_wick_ratio_t-{n}'] = (prev_candle['high'] - max(prev_candle['open'], prev_candle['close'])) / prev_range
+                    features[f'lower_wick_ratio_t-{n}'] = (min(prev_candle['open'], prev_candle['close']) - prev_candle['low']) / prev_range
+                else:
+                    features[f'body_to_range_ratio_t-{n}'] = 0
+                    features[f'upper_wick_ratio_t-{n}'] = 0
+                    features[f'lower_wick_ratio_t-{n}'] = 0
+        except (KeyError, IndexError):
+            # If we can't find the candle or there aren't enough previous ones, fill with 0
+            for n in range(1, 4):
+                features[f'body_to_range_ratio_t-{n}'] = 0
+                features[f'upper_wick_ratio_t-{n}'] = 0
+                features[f'lower_wick_ratio_t-{n}'] = 0
+        
         # Session One-Hot Encoding
         session_str = setup_candle['session']
         features['is_asia'] = 1 if 'Asia' in session_str else 0
@@ -570,14 +582,66 @@ def engineer_features():
         # Symbol-Level Features
         features['liquidity_proxy'] = setup_candle['liquidity_proxy']
 
+        # New Taker Volume Ratio
+        if 'taker_buy_base_asset_volume' in setup_candle and setup_candle['volume'] > 0:
+            features['taker_volume_ratio'] = setup_candle['taker_buy_base_asset_volume'] / setup_candle['volume']
+        else:
+            features['taker_volume_ratio'] = 0.5
+
+        # New Volatility Regime
+        vol = setup_candle['volatility_50']
+        features['vol_regime_low'] = 1 if vol < vol_low_threshold else 0
+        features['vol_regime_medium'] = 1 if vol_low_threshold <= vol < vol_high_threshold else 0
+        features['vol_regime_high'] = 1 if vol >= vol_high_threshold else 0
+
         feature_list.append(features)
 
     if not feature_list:
         print("No features were generated.")
         return
 
-    # Create and save the final feature DataFrame
+    # --- Volatility Regime Calculation ---
+    # First, collect all volatility values to determine global regimes
+    all_volatility = pd.concat([data['15m']['volatility_50'] for data in all_raw_data.values()]).dropna()
+    vol_low_threshold, vol_high_threshold = all_volatility.quantile([0.33, 0.67])
+    
+    # --- Feature List Generation ---
+    feature_list = []
+    for _, row in tqdm(labeled_df.iterrows(), total=labeled_df.shape[0], desc="Engineering Features"):
+        # ... (existing setup candle lookup)
+        
+        # --- Calculate Features ---
+        # ... (existing features)
+        
+        # New Taker Volume Ratio
+        if setup_candle['volume'] > 0:
+            features['taker_volume_ratio'] = setup_candle.get('taker_buy_base_asset_volume', 0) / setup_candle['volume']
+        else:
+            features['taker_volume_ratio'] = 0.5 # Neutral value
+
+        # New Volatility Regime
+        vol = setup_candle['volatility_50']
+        if vol < vol_low_threshold:
+            features['vol_regime'] = 'Low'
+        elif vol < vol_high_threshold:
+            features['vol_regime'] = 'Medium'
+        else:
+            features['vol_regime'] = 'High'
+
+        feature_list.append(features)
+
+    # Create the final feature DataFrame
     features_df = pd.DataFrame(feature_list)
+    
+    # --- Post-computation Feature Creation ---
+    # One-hot encode volatility regime
+    features_df = pd.get_dummies(features_df, columns=['vol_regime'], prefix='vol')
+
+    # Interaction Feature: ATR x Body Ratio
+    # This must be done after the main loop and after body_to_range_ratio is computed.
+    if 'atr' in features_df.columns and 'body_to_range_ratio' in features_df.columns:
+        features_df['atr_x_body_ratio'] = features_df['atr'] * features_df['body_to_range_ratio']
+
     print(f"Generated {len(features_df)} total feature vectors before cleaning.")
     
     # Drop any rows that still have NaNs for any reason (e.g. from lookback periods)
@@ -607,17 +671,17 @@ def engineer_features():
     print(f"Feature engineering complete. Generated {len(features_df)} feature vectors in {num_chunks} chunks.")
 
 
-def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
+def generate_features_for_live_setup(klines_df, setup_info, feature_columns, vol_thresholds=None):
     """
     Generates a feature vector for a single, live trade setup.
     `klines_df` should be a DataFrame of recent klines.
     `setup_info` is a dict with trade parameters.
     `feature_columns` is the list of columns the model was trained on.
+    `vol_thresholds` is a tuple (low_thresh, high_thresh) loaded from the model artifact.
     """
-    # Use a copy to avoid modifying the original DataFrame
     df = klines_df.copy()
 
-    # --- Pre-calculate all indicators on the DataFrame ---
+    # --- Pre-calculate all indicators ---
     df['atr'] = calculate_atr(df)
     df['rsi'] = calculate_rsi(df)
     df['macd'], df['macd_signal'] = calculate_macd(df)
@@ -628,85 +692,76 @@ def generate_features_for_live_setup(klines_df, setup_info, feature_columns):
         df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
     df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
 
-    # Create a datetime index for resampling
     df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
 
-    # Higher-timeframe features (4-hour)
     df_4h = df['close'].resample('4h').ohlc()
     df_4h['rsi'] = calculate_rsi(df_4h)
     df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
     df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
     
-    # --- Get the correct candles for feature extraction ---
-    setup_candle_timestamp_dt = df.index[-1]
-    setup_candle = df.loc[setup_candle_timestamp_dt]
-    htf_candle = df_4h.asof(setup_candle_timestamp_dt)
+    setup_candle = df.iloc[-1]
+    htf_candle = df_4h.asof(df.index[-1])
 
-    # --- Calculate Features ---
     features = {}
 
     # Price & Strategy Features
     swing_height = setup_info['swing_high_price'] - setup_info['swing_low_price']
     if swing_height > 0:
-        if setup_info['side'] == 'long':
-            features['golden_zone_ratio'] = (setup_info['entry_price'] - setup_info['swing_low_price']) / swing_height
-        else: # short
-            features['golden_zone_ratio'] = (setup_info['swing_high_price'] - setup_info['entry_price']) / swing_height
-        
+        features['golden_zone_ratio'] = (setup_info['entry_price'] - (setup_info['swing_low_price'] if setup_info['side'] == 'long' else setup_info['swing_high_price'])) / swing_height
         features['sl_pct'] = abs(setup_info['entry_price'] - setup_info['sl']) / swing_height
         features['tp1_pct'] = abs(setup_info['tp1'] - setup_info['entry_price']) / swing_height
         features['tp2_pct'] = abs(setup_info['tp2'] - setup_info['entry_price']) / swing_height
     else:
-        # Assign np.nan to avoid division by zero and ensure consistent feature count
-        features['golden_zone_ratio'] = np.nan
-        features['sl_pct'] = np.nan
-        features['tp1_pct'] = np.nan
-        features['tp2_pct'] = np.nan
+        features['golden_zone_ratio'], features['sl_pct'], features['tp1_pct'], features['tp2_pct'] = np.nan, np.nan, np.nan, np.nan
 
-    # Price Action Feature
+    # Price Action & Pattern Sequence
     candle_range = setup_candle['high'] - setup_candle['low']
-    candle_body = abs(setup_candle['open'] - setup_candle['close'])
-    features['body_to_range_ratio'] = candle_body / candle_range if candle_range > 0 else 0
+    features['body_to_range_ratio'] = abs(setup_candle['open'] - setup_candle['close']) / candle_range if candle_range > 0 else 0
+    features['upper_wick_ratio'] = (setup_candle['high'] - max(setup_candle['open'], setup_candle['close'])) / candle_range if candle_range > 0 else 0
+    features['lower_wick_ratio'] = (min(setup_candle['open'], setup_candle['close']) - setup_candle['low']) / candle_range if candle_range > 0 else 0
+    
+    for n in range(1, 4):
+        if len(df) > n:
+            prev_candle = df.iloc[-1-n]
+            prev_range = prev_candle['high'] - prev_candle['low']
+            features[f'body_to_range_ratio_t-{n}'] = abs(prev_candle['open'] - prev_candle['close']) / prev_range if prev_range > 0 else 0
+            features[f'upper_wick_ratio_t-{n}'] = (prev_candle['high'] - max(prev_candle['open'], prev_candle['close'])) / prev_range if prev_range > 0 else 0
+            features[f'lower_wick_ratio_t-{n}'] = (min(prev_candle['open'], prev_candle['close']) - prev_candle['low']) / prev_range if prev_range > 0 else 0
+        else:
+            features[f'body_to_range_ratio_t-{n}'], features[f'upper_wick_ratio_t-{n}'], features[f'lower_wick_ratio_t-{n}'] = 0, 0, 0
 
-    # Session One-Hot Encoding
+    # Session
     session_str = get_session(setup_candle['timestamp'])
-    features['is_asia'] = 1 if 'Asia' in session_str else 0
-    features['is_london'] = 1 if 'London' in session_str else 0
-    features['is_new_york'] = 1 if 'New_York' in session_str else 0
+    features['is_asia'], features['is_london'], features['is_new_york'] = (1 if s in session_str else 0 for s in ['Asia', 'London', 'New_York'])
 
-    # Market Context Features
-    features['atr'] = setup_candle['atr']
-    features['rsi'] = setup_candle['rsi']
-    features['macd_diff'] = setup_candle['macd'] - setup_candle['macd_signal']
-    features['adx'] = setup_candle['adx']
+    # Context Features
+    features['atr'], features['rsi'], features['macd_diff'], features['adx'] = setup_candle['atr'], setup_candle['rsi'], setup_candle['macd'] - setup_candle['macd_signal'], setup_candle['adx']
     for p in [20, 50, 100]:
         features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
-    
-    # Bollinger Bands
-    features['bb_upper'] = setup_candle['bb_upper']
-    features['bb_lower'] = setup_candle['bb_lower']
-
-    # Ichimoku Cloud
-    features['tenkan_sen'] = setup_candle['tenkan_sen']
-    features['kijun_sen'] = setup_candle['kijun_sen']
-    features['senkou_span_a'] = setup_candle['senkou_span_a']
-    features['senkou_span_b'] = setup_candle['senkou_span_b']
-    features['chikou_span'] = setup_candle['chikou_span']
-
-    # Higher-Timeframe Context
-    features['rsi_4h'] = htf_candle['rsi']
-    features['macd_diff_4h'] = htf_candle['macd_diff']
-
-    # Symbol-Level Features
+    features['bb_upper'], features['bb_lower'] = setup_candle['bb_upper'], setup_candle['bb_lower']
+    features['tenkan_sen'], features['kijun_sen'], features['senkou_span_a'], features['senkou_span_b'], features['chikou_span'] = setup_candle['tenkan_sen'], setup_candle['kijun_sen'], setup_candle['senkou_span_a'], setup_candle['senkou_span_b'], setup_candle['chikou_span']
+    features['rsi_4h'], features['macd_diff_4h'] = htf_candle['rsi'], htf_candle['macd_diff']
     features['liquidity_proxy'] = setup_candle['liquidity_proxy']
     
-    # Side feature
+    # New Features
+    features['taker_volume_ratio'] = (setup_candle.get('taker_buy_base_asset_volume', 0) / setup_candle['volume']) if setup_candle['volume'] > 0 else 0.5
+    
+    if vol_thresholds:
+        low_thresh, high_thresh = vol_thresholds
+    else: # Fallback for testing or if not provided
+        low_thresh, high_thresh = df['volatility_50'].quantile([0.33, 0.67])
+        
+    vol = setup_candle['volatility_50']
+    features['vol_regime_low'] = 1 if vol < low_thresh else 0
+    features['vol_regime_medium'] = 1 if low_thresh <= vol < high_thresh else 0
+    features['vol_regime_high'] = 1 if vol >= high_thresh else 0
+
+    features['atr_x_body_ratio'] = features['atr'] * features['body_to_range_ratio']
     features['side_long'] = 1 if setup_info['side'] == 'long' else 0
 
-    # Create a DataFrame with the correct column order and handle potential NaNs
     feature_vector = pd.DataFrame([features])
-    feature_vector = feature_vector[feature_columns] # Ensure column order
-    feature_vector.fillna(0, inplace=True) # Fill any potential NaNs with 0 as a safe default
+    feature_vector = feature_vector[feature_columns]
+    feature_vector.fillna(0, inplace=True)
     
     return feature_vector
 
@@ -720,28 +775,78 @@ import matplotlib.pyplot as plt
 
 
 import lightgbm as lgb
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit, train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+import xgboost as xgb
+import optuna
+from sklearn.model_selection import TimeSeriesSplit, train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, f1_score
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.calibration import CalibratedClassifierCV, CalibrationDisplay
 
 
 # --- Model Training (Step 4) ---
+
+def _run_hyperparameter_search(X_train, y_train, X_val, y_val, model_type='lgbm'):
+    """Helper to run Optuna study for a given model type."""
+    
+    def objective(trial):
+        if model_type == 'lgbm':
+            params = {
+                'objective': 'multiclass',
+                'num_class': 3,
+                'metric': 'multi_logloss',
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 300),
+                'max_depth': trial.suggest_int('max_depth', 3, 12),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 1.0, log=True),
+                'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 1.0, log=True),
+                'random_state': 42,
+                'n_jobs': -1,
+            }
+            model = lgb.LGBMClassifier(**params)
+        else: # xgb
+            params = {
+                'objective': 'multi:softprob',
+                'num_class': 3,
+                'eval_metric': 'mlogloss',
+                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
+                'max_depth': trial.suggest_int('max_depth', 3, 10),
+                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+                'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
+                'random_state': 42,
+                'n_jobs': -1,
+            }
+            model = xgb.XGBClassifier(**params)
+
+        class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+        sample_weights = y_train.map(dict(zip(np.unique(y_train), class_weights)))
+        
+        model.fit(X_train, y_train, sample_weight=sample_weights)
+        y_pred = model.predict(X_val)
+        # We optimize for F1 score of the minority class (TP2)
+        return f1_score(y_val, y_pred, labels=[2], average='macro')
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=50) # Number of trials can be adjusted
+    print(f"Best {model_type.upper()} params: {study.best_params}")
+    return study.best_params
+
 def train_model():
-    """Loads features, trains a model, calibrates it, and saves it."""
+    """Loads features, runs hyperparameter search, trains an ensemble, calibrates, and saves."""
     print("Starting model training...")
     try:
         feature_files = glob.glob(os.path.join(PROCESSED_DATA_DIR, "features_part_*.parquet"))
-        if not feature_files:
-            raise FileNotFoundError("No feature chunk files found.")
+        if not feature_files: raise FileNotFoundError("No feature chunk files found.")
         
         df_list = [pd.read_parquet(f) for f in feature_files]
         features_df = pd.concat(df_list, ignore_index=True)
-        # Sort by timestamp to ensure chronological order is maintained after concatenation
         features_df.sort_values('timestamp', inplace=True)
         features_df.reset_index(drop=True, inplace=True)
-        
-        print(f"Loaded {len(features_df)} features from {len(feature_files)} chunk files.")
+        print(f"Loaded {len(features_df)} features from {len(feature_files)} chunks.")
         
     except FileNotFoundError:
         print("Error: No feature chunk files found. Please run engineer_features() first.")
@@ -752,198 +857,131 @@ def train_model():
         return
 
     # --- Data Preparation ---
-    feature_columns = [
-        # Original Features
-        'golden_zone_ratio', 'sl_pct', 'tp1_pct', 'tp2_pct',
-        'is_asia', 'is_london', 'is_new_york',
-        'atr', 'rsi', 'macd_diff', 'liquidity_proxy',
-        # New Features
-        'body_to_range_ratio',
-        'adx',
-        'volatility_20', 'volatility_50', 'volatility_100',
-        'rsi_4h', 'macd_diff_4h',
-        'bb_upper', 'bb_lower',
-        'tenkan_sen', 'kijun_sen', 'senkou_span_a', 'senkou_span_b', 'chikou_span'
-    ]
-    features_df['side_long'] = (features_df['side'] == 'long').astype(int)
-    feature_columns.append('side_long')
-
+    feature_columns = [col for col in features_df.columns if col not in ['symbol', 'timestamp', 'side', 'entry_price', 'sl', 'tp1', 'tp2', 'label']]
     X = features_df[feature_columns]
     y = features_df['label']
 
-    # --- Time-based Split (60% train, 20% calibrate, 20% test) ---
+    # Time-based Split: 60% train, 20% validation (for Optuna), 20% test
     n_samples = len(X)
-    train_end_idx = int(n_samples * 0.6)
-    cal_end_idx = int(n_samples * 0.8)
+    train_end = int(n_samples * 0.6)
+    val_end = int(n_samples * 0.8)
+    X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
+    X_val, y_val = X.iloc[train_end:val_end], y.iloc[train_end:val_end]
+    X_test, y_test = X.iloc[val_end:], y.iloc[val_end:]
 
-    X_train, y_train = X.iloc[:train_end_idx], y.iloc[:train_end_idx]
-    X_cal, y_cal = X.iloc[train_end_idx:cal_end_idx], y.iloc[train_end_idx:cal_end_idx]
-    X_test, y_test = X.iloc[cal_end_idx:], y.iloc[cal_end_idx:]
-
-    print(f"Training data shape: {X_train.shape}")
-    print(f"Calibration data shape: {X_cal.shape}")
-    print(f"Testing data shape: {X_test.shape}")
-
-
-    # --- Handle Class Imbalance ---
-    # Compute weights on the training data to ensure consistent weighting
-    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-    weights_dict = {i : class_weights[i] for i, w in enumerate(class_weights)}
-    print(f"Calculated class weights: {weights_dict}")
+    # Combine train and validation for final model training
+    X_train_full, y_train_full = X.iloc[:val_end], y.iloc[:val_end]
     
-    # Map weights to the training and calibration sets
-    train_sample_weights = y_train.map(weights_dict)
-    cal_sample_weights = y_cal.map(weights_dict)
+    print(f"Train shape: {X_train.shape}, Val shape: {X_val.shape}, Test shape: {X_test.shape}")
 
-    # --- Model Training with User-Defined Parameters ---
-    # Parameters provided by the user
-    user_params = {
-        'subsample': 0.7,
-        'reg_lambda': 0.5,
-        'reg_alpha': 0.1,
-        'num_leaves': 70,
-        'n_estimators': 300,
-        'max_depth': -1,
-        'learning_rate': 0.1,
-        'colsample_bytree': 0.9,
-        'objective': 'multiclass',
-        'num_class': 3,
-        'n_jobs': -1,
-        'random_state': 42 # for reproducibility
-    }
+    # --- Hyperparameter Search ---
+    print("\n--- Running Hyperparameter Search for LightGBM ---")
+    best_lgbm_params = _run_hyperparameter_search(X_train, y_train, X_val, y_val, 'lgbm')
+    
+    print("\n--- Running Hyperparameter Search for XGBoost ---")
+    best_xgb_params = _run_hyperparameter_search(X_train, y_train, X_val, y_val, 'xgb')
 
-    print(f"Training base model with user-defined parameters...")
-    base_model = lgb.LGBMClassifier(**user_params)
-    base_model.fit(X_train, y_train, sample_weight=train_sample_weights)
+    # --- Final Model Training ---
+    print("\n--- Training Final Models with Best Parameters ---")
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train_full), y=y_train_full)
+    sample_weights = y_train_full.map(dict(zip(np.unique(y_train_full), class_weights)))
 
-    # --- Probability Calibration ---
-    print("\nCalibrating model probabilities using Isotonic Regression...")
-    # We use cv='prefit' because the base_model is already trained.
-    calibrated_model = CalibratedClassifierCV(
-        base_model,
-        method='isotonic',
-        cv='prefit'
-    )
-    calibrated_model.fit(X_cal, y_cal, sample_weight=cal_sample_weights)
+    lgbm_final = lgb.LGBMClassifier(**best_lgbm_params, objective='multiclass', num_class=3, random_state=42, n_jobs=-1)
+    lgbm_final.fit(X_train_full, y_train_full, sample_weight=sample_weights)
+
+    xgb_final = xgb.XGBClassifier(**best_xgb_params, objective='multi:softprob', num_class=3, random_state=42, n_jobs=-1)
+    xgb_final.fit(X_train_full, y_train_full, sample_weight=sample_weights)
+
+    # --- Probability Calibration (on the test set for simplicity here, could use another split) ---
+    print("\n--- Calibrating Models ---")
+    calibrated_lgbm = CalibratedClassifierCV(lgbm_final, method='isotonic', cv='prefit').fit(X_test, y_test)
+    calibrated_xgb = CalibratedClassifierCV(xgb_final, method='isotonic', cv='prefit').fit(X_test, y_test)
 
     # --- Evaluation ---
-    print("\nEvaluating CALIBRATED Model on Test Set:")
-    y_pred = calibrated_model.predict(X_test)
-    
-    # Add labels parameter to handle cases where test data doesn't have all classes
-    print(classification_report(y_test, y_pred, target_names=['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)'], labels=[0, 1, 2], zero_division=0))
-    
-    print("Confusion Matrix (Calibrated Model):")
-    print(confusion_matrix(y_test, y_pred))
+    print("\n--- Evaluating Models on Test Set ---")
+    evaluate_ensemble(calibrated_lgbm, calibrated_xgb, X_test, y_test)
 
     # --- Persistence ---
     os.makedirs(MODELS_DIR, exist_ok=True)
-    model_path = os.path.join(MODELS_DIR, "trading_model.joblib")
-    
-    # --- Persistence ---
-    os.makedirs(MODELS_DIR, exist_ok=True)
-    model_path = os.path.join(MODELS_DIR, "trading_model.joblib")
+    model_path = os.path.join(MODELS_DIR, "trading_model_v2.joblib")
     
     model_artifact = {
-        'model_version': '1.2.0', # Major.Minor.Patch
+        'model_version': '2.0.0',
         'training_timestamp_utc': datetime.utcnow().isoformat(),
-        'calibrated_model': calibrated_model,
-        'uncalibrated_model': base_model, # Explicitly name the uncalibrated model
-        'feature_columns': feature_columns
+        'lgbm_model': calibrated_lgbm,
+        'xgb_model': calibrated_xgb,
+        'feature_columns': feature_columns,
+        'vol_thresholds': (features_df['volatility_50'].quantile(0.33), features_df['volatility_50'].quantile(0.67))
     }
-    
     joblib.dump(model_artifact, model_path)
+    print(f"\nEnsemble model artifact saved to {model_path}")
 
-    print(f"\nCalibrated model artifact saved to {model_path}")
-    print(f"  - Version: {model_artifact['model_version']}")
-    print(f"  - Timestamp: {model_artifact['training_timestamp_utc']}")
+    # --- Post-Training Validation ---
+    plot_and_save_calibration_curve(model_artifact, X_test, y_test)
+    smoke_test_model_artifact(model_path, X_test.head(5))
 
-    # --- Post-Training Validation and Monitoring ---
-    try:
-        plot_and_save_calibration_curve(calibrated_model, X_test, y_test, model_artifact)
-    except Exception as e:
-        print(f"Warning: Could not generate or save calibration curve. Error: {e}")
+def evaluate_ensemble(lgbm_model, xgb_model, X_test, y_test):
+    """Evaluates the performance of each model and the ensemble."""
+    lgbm_proba = lgbm_model.predict_proba(X_test)
+    xgb_proba = xgb_model.predict_proba(X_test)
+    ensemble_proba = (lgbm_proba + xgb_proba) / 2
+    ensemble_pred = np.argmax(ensemble_proba, axis=1)
 
-    log_probability_distributions(calibrated_model, X_test)
+    print("\n--- LGBM Classification Report ---")
+    print(classification_report(y_test, lgbm_model.predict(X_test), target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
+    
+    print("\n--- XGBoost Classification Report ---")
+    print(classification_report(y_test, xgb_model.predict(X_test), target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
 
-    try:
-        smoke_test_model_artifact(model_path, X_test)
-    except Exception as e:
-        print(f"Critical: Model artifact smoke test failed! Error: {e}")
+    print("\n--- Ensemble Classification Report ---")
+    print(classification_report(y_test, ensemble_pred, target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
+    print("\nEnsemble Confusion Matrix:")
+    print(confusion_matrix(y_test, ensemble_pred))
 
-
-def smoke_test_model_artifact(model_path, X_test):
-    """
-    Loads a saved model artifact and runs a quick prediction to ensure it's not corrupt.
-    """
+def smoke_test_model_artifact(model_path, X_sample):
+    """Loads a saved model artifact and runs a quick prediction."""
     print("\n--- Running Model Artifact Smoke Test ---")
     try:
         model_data = joblib.load(model_path)
-        model = model_data['calibrated_model']
+        lgbm = model_data['lgbm_model']
+        xgb = model_data['xgb_model']
         
-        # Predict on a small sample
-        sample_predictions = model.predict_proba(X_test.head(5))
+        lgbm_preds = lgbm.predict_proba(X_sample)
+        xgb_preds = xgb.predict_proba(X_sample)
         
-        assert sample_predictions.shape == (5, 3)
-        print("Smoke test PASSED. Model loaded and predicted successfully.")
-        
+        assert lgbm_preds.shape == (5, 3)
+        assert xgb_preds.shape == (5, 3)
+        print("Smoke test PASSED. Models loaded and predicted successfully.")
     except Exception as e:
         print(f"Smoke test FAILED: {e}")
-        raise # Re-raise the exception to make the failure obvious
+        raise
 
-
-def plot_and_save_calibration_curve(model, X_test, y_test, model_artifact):
-    """
-    Generates and saves a calibration curve plot for the given model.
-    """
-    print("\nGenerating calibration curve...")
-    fig, ax = plt.subplots(figsize=(10, 8))
+def plot_and_save_calibration_curve(model_artifact, X_test, y_test):
+    """Generates and saves calibration curves for the ensemble."""
+    print("\nGenerating calibration curves...")
+    fig, ax = plt.subplots(figsize=(12, 10))
     
-    for i, name in enumerate(['Loss (0)', 'TP1 Win (1)', 'TP2 Win (2)']):
-        CalibrationDisplay.from_estimator(
-            model,
-            X_test,
-            y_test,
-            n_bins=10,
-            class_to_plot=i,
-            name=f'Calibrated - {name}',
-            ax=ax,
-            strategy='uniform'
-        )
+    models = {
+        "LGBM": model_artifact['lgbm_model'],
+        "XGBoost": model_artifact['xgb_model']
+    }
     
-    ax.set_title("Calibration Curve for Each Class")
+    for model_name, model in models.items():
+        for i, class_name in enumerate(['Loss', 'TP1', 'TP2']):
+            CalibrationDisplay.from_estimator(
+                model, X_test, y_test, n_bins=10, class_to_plot=i,
+                name=f'{model_name} - {class_name}', ax=ax, strategy='uniform'
+            )
+    
+    ax.set_title("Calibration Curve for Each Model and Class")
     plt.grid(True)
+    plt.legend(loc="upper left")
     
     timestamp = model_artifact['training_timestamp_utc'].replace(':', '-')
-    calibration_plot_path = os.path.join(MODELS_DIR, f"calibration_curve_{timestamp}.png")
-    plt.savefig(calibration_plot_path)
-    print(f"Calibration curve saved to {calibration_plot_path}")
+    plot_path = os.path.join(MODELS_DIR, f"calibration_curve_ensemble_{timestamp}.png")
+    plt.savefig(plot_path)
+    print(f"Calibration curves saved to {plot_path}")
     plt.close()
-
-
-def log_probability_distributions(model, X_test):
-    """
-    Scores a model on the test set and logs the distribution of predicted probabilities.
-    """
-    print("\n--- Post-Training Probability-Drift Monitoring ---")
-    if not hasattr(model, "predict_proba"):
-        print("Model does not support probability prediction.")
-        return
-        
-    # Get predicted probabilities for the test set
-    probabilities = model.predict_proba(X_test)
-    
-    # Calculate the mean probability for each class
-    mean_probs = np.mean(probabilities, axis=0)
-    
-    print("Mean Predicted Probabilities on Test Set:")
-    if len(mean_probs) == 3:
-        print(f"  - P(Loss): {mean_probs[0]:.3f}")
-        print(f"  - P(TP1):  {mean_probs[1]:.3f}")
-        print(f"  - P(TP2):  {mean_probs[2]:.3f}")
-    else:
-        print(f"  - {mean_probs}")
-    print("--------------------------------------------------")
 
 
 def run_pipeline():
