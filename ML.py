@@ -1,8 +1,4 @@
-# For use in Google Colab, run this cell first to install dependencies
-# !pip install pandas numpy pyarrow python-binance matplotlib tqdm scikit-learn torch
-
 import os
-import sys
 import pandas as pd
 import numpy as np
 import pytz
@@ -31,32 +27,10 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # --- Configuration ---
-# Check if running in Google Colab
-IN_COLAB = 'google.colab' in sys.modules
-
-if IN_COLAB:
-    from google.colab import drive
-    drive.mount('/content/drive')
-    
-    # Set up a root directory in your Google Drive
-    DRIVE_ROOT = '/content/drive/MyDrive/Colab_ML_Project'
-    DATA_DIR = os.path.join(DRIVE_ROOT, "data/raw")
-    PROCESSED_DATA_DIR = os.path.join(DRIVE_ROOT, "data/processed")
-    MODELS_DIR = os.path.join(DRIVE_ROOT, "models")
-    # Make sure the symbols file is placed in the root of your Drive project folder
-    SYMBOLS_FILE = os.path.join(DRIVE_ROOT, "symbols.csv")
-    
-    # Create directories if they don't exist
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-    os.makedirs(MODELS_DIR, exist_ok=True)
-
-else:
-    DATA_DIR = "data/raw"
-    PROCESSED_DATA_DIR = "data/processed"
-    MODELS_DIR = "models"
-    SYMBOLS_FILE = "symbols.csv"
-
+DATA_DIR = "data/raw"
+PROCESSED_DATA_DIR = "data/processed"
+MODELS_DIR = "models"
+SYMBOLS_FILE = "symbols.csv"
 SWING_WINDOW = 5
 LOOKBACK_CANDLES = 100
 TRADE_EXPIRY_BARS = 96
@@ -78,7 +52,7 @@ def fetch_historical_for_symbol(symbol, total_limit=20000):
     all_klines = []
     limit = 1000
     # To prevent infinite loops for symbols with no data
-    max_attempts = 25
+    max_attempts = 5
     attempts = 0
     while len(all_klines) < total_limit and attempts < max_attempts:
         try:
@@ -212,20 +186,8 @@ def get_swing_points_df(df, window=5):
 
 def get_trend_df(swing_highs, swing_lows):
     if len(swing_highs) < 2 or len(swing_lows) < 2: return "undetermined"
-    
-    is_higher_high = swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2]
-    is_higher_low = swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]
-    is_lower_high = swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2]
-    is_lower_low = swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]
-
-    # Uptrend: Must make a higher high, and the low must not be broken.
-    if is_higher_high and not is_lower_low:
-        return "uptrend"
-        
-    # Downtrend: Must make a lower low, and the high must not be broken.
-    if is_lower_low and not is_higher_high:
-        return "downtrend"
-        
+    if swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]: return "uptrend"
+    if swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]: return "downtrend"
     return "undetermined"
 
 def get_fib_retracement(p1, p2, trend):
@@ -257,8 +219,7 @@ def find_and_label_setups(df):
     # 1. Pre-calculate all swing points for the entire DataFrame at once
     all_swing_highs, all_swing_lows = get_swing_points_df(df, SWING_WINDOW)
 
-    # Loop until there's enough space for lookback, entry search, and trade duration
-    for i in tqdm(range(LOOKBACK_CANDLES, len(df) - (2 * TRADE_EXPIRY_BARS)), desc="Finding Setups"):
+    for i in tqdm(range(LOOKBACK_CANDLES, len(df) - TRADE_EXPIRY_BARS), desc="Finding Setups"):
         if df['session'].iloc[i] == 'Inactive':
             continue
             
@@ -278,13 +239,14 @@ def find_and_label_setups(df):
         
         if trend == 'downtrend':
             last_swing_high_price, last_swing_low_price = swing_highs.iloc[-1]['price'], swing_lows.iloc[-1]['price']
+            if last_swing_low_price >= swing_lows.iloc[-2]['price']: continue
             entry_price = get_fib_retracement(last_swing_high_price, last_swing_low_price, trend)
             sl = last_swing_high_price
             tp1 = entry_price - (sl - entry_price)
             tp2 = entry_price - (sl - entry_price) * 2
             
-            # Find entry candle (must occur AFTER the setup candle `i`)
-            future_candles = df.iloc[i + 1 : i + 1 + TRADE_EXPIRY_BARS]
+            # Find entry candle
+            future_candles = df.iloc[i : i + TRADE_EXPIRY_BARS]
             entry_mask = future_candles['high'] >= entry_price
             if not entry_mask.any(): continue
             entry_candle_idx = future_candles.index[entry_mask][0]
@@ -295,13 +257,14 @@ def find_and_label_setups(df):
 
         elif trend == 'uptrend':
             last_swing_high_price, last_swing_low_price = swing_highs.iloc[-1]['price'], swing_lows.iloc[-1]['price']
+            if last_swing_high_price <= swing_highs.iloc[-2]['price']: continue
             entry_price = get_fib_retracement(last_swing_low_price, last_swing_high_price, trend)
             sl = last_swing_low_price
             tp1 = entry_price + (entry_price - sl)
             tp2 = entry_price + (entry_price - sl) * 2
             
-            # Find entry candle (must occur AFTER the setup candle `i`)
-            future_candles = df.iloc[i + 1 : i + 1 + TRADE_EXPIRY_BARS]
+            # Find entry candle
+            future_candles = df.iloc[i : i + TRADE_EXPIRY_BARS]
             entry_mask = future_candles['low'] <= entry_price
             if not entry_mask.any(): continue
             entry_candle_idx = future_candles.index[entry_mask][0]
@@ -540,7 +503,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.inf
+        self.val_loss_min = np.Inf
         self.delta = delta
         self.path = path
         self.trace_func = trace_func
@@ -640,22 +603,11 @@ def train_model(sequences, static_features, labels, labeled_setups_df, loss_type
     train_dataset = TensorDataset(X_seq_train_t, X_static_train_t, y_train_t)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True) # Increased batch size
 
-    # --- Robust Class Weighting ---
-    num_classes = 3 # Define the total number of classes
-    unique_labels = np.unique(y_train)
-    class_weights_computed = compute_class_weight('balanced', classes=unique_labels, y=y_train)
-    
-    # Create a full weight tensor, initializing with 1.0 for all classes
-    full_class_weights = torch.ones(num_classes, dtype=torch.float32)
-    
-    # Map computed weights to their corresponding class index
-    for i, label in enumerate(unique_labels):
-        full_class_weights[label] = class_weights_computed[i]
-        
-    class_weights_tensor = full_class_weights.to(DEVICE)
-    print(f"Using class weights: {class_weights_tensor.cpu().numpy()}")
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
+    print(f"Using class weights: {class_weights}")
 
-    model = LSTMModel(X_seq_train.shape[2], X_static_train.shape[1], num_classes=num_classes).to(DEVICE)
+    model = LSTMModel(X_seq_train.shape[2], X_static_train.shape[1]).to(DEVICE)
     
     if loss_type == 'focal':
         print("Using Focal Loss")
@@ -665,7 +617,7 @@ def train_model(sequences, static_features, labels, labeled_setups_df, loss_type
         criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
         
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
     
     model_path = os.path.join(MODELS_DIR, 'pytorch_lstm_model.pth')
     os.makedirs(MODELS_DIR, exist_ok=True)
@@ -806,125 +758,87 @@ def plot_backtest_results(equity_curve):
     print(f"Backtest chart saved to: {chart_path}")
     plt.close()
 
-import tempfile
-import shutil
-
 def run_pipeline(quick_test=False):
     print("--- Starting Full PyTorch Model Pipeline ---")
-    
-    global DATA_DIR, PROCESSED_DATA_DIR, MODELS_DIR
-    temp_dir = None
-
     if quick_test:
         print("--- RUNNING IN QUICK TEST MODE ---")
-        temp_dir = tempfile.mkdtemp()
-        DATA_DIR = os.path.join(temp_dir, "data/raw")
-        PROCESSED_DATA_DIR = os.path.join(temp_dir, "data/processed")
-        MODELS_DIR = os.path.join(temp_dir, "models")
-        print(f"Using temporary directory: {temp_dir}")
+    print(f"Using device: {DEVICE}")
 
+    # Check for raw data, fetch if needed
+    raw_data_exists = os.path.exists(DATA_DIR) and len(glob.glob(os.path.join(DATA_DIR, '*', '*.parquet'))) > 0
+    if not raw_data_exists:
+        print("Raw data not found. Fetching initial historical data...")
+        fetch_initial_data(SESSIONS, quick_test=quick_test)
+    else:
+        print("Raw data directory found. Skipping initial fetch.")
+
+    # Check for labeled data, preprocess if needed
+    labeled_data_filename = "labeled_trades_quick.parquet" if quick_test else "labeled_trades.parquet"
+    labeled_data_path = os.path.join(PROCESSED_DATA_DIR, labeled_data_filename)
+    if not os.path.exists(labeled_data_path):
+        print("Labeled data not found. Running preprocessing...")
+        main_preprocess(SESSIONS, quick_test=quick_test)
+    else:
+        print("Found existing labeled data, skipping preprocessing.")
+        
     try:
-        print(f"Using device: {DEVICE}")
+        labeled_df = pd.read_parquet(labeled_data_path)
+    except Exception as e:
+        print(f"Could not read labeled data file: {e}. It might be empty if no setups were found."); return
 
-        # Check for raw data, fetch if needed
-        raw_data_exists = os.path.exists(DATA_DIR) and len(glob.glob(os.path.join(DATA_DIR, '*', '*.parquet'))) > 0
-        if not raw_data_exists:
-            print("Raw data not found. Fetching initial historical data...")
-            fetch_initial_data(SESSIONS, quick_test=quick_test)
-        else:
-            print("Raw data directory found. Skipping initial fetch.")
+    if labeled_df.empty:
+        print("No labeled setups were generated during preprocessing. Exiting.")
+        return
 
-        # Check for labeled data, preprocess if needed
-        labeled_data_filename = "labeled_trades_quick.parquet" if quick_test else "labeled_trades.parquet"
-        labeled_data_path = os.path.join(PROCESSED_DATA_DIR, labeled_data_filename)
-        if not os.path.exists(labeled_data_path):
-            print("Labeled data not found. Running preprocessing...")
-            main_preprocess(SESSIONS, quick_test=quick_test)
-        else:
-            print("Found existing labeled data, skipping preprocessing.")
-        
-        try:
-            labeled_df = pd.read_parquet(labeled_data_path)
-        except Exception as e:
-            print(f"Could not read labeled data file: {e}. It might be empty if no setups were found."); return
-
-        if labeled_df.empty:
-            print("No labeled setups were generated during preprocessing. Exiting.")
-            return
-
-        labeled_df = labeled_df[labeled_df['label'] != -1].copy()
-        if labeled_df.empty:
-            print("No valid labeled setups found after filtering for label != -1. Exiting."); return
-        
-        sequences, static_features, labels, _ = create_sequences_and_features(labeled_df)
-        if len(sequences) == 0:
-            print("No sequences were generated from the labeled data. Exiting."); return
-        
-        model, test_seq, test_static, test_setups = train_model(sequences, static_features, labels, labeled_df)
-        
-        equity_curve, trades_log = run_backtest(model, test_seq, test_static, test_setups)
-        
-        plot_backtest_results(equity_curve)
-        print("\n--- PyTorch Pipeline Finished ---")
-    finally:
-        if temp_dir:
-            print(f"Cleaning up temporary directory: {temp_dir}")
-            shutil.rmtree(temp_dir)
+    labeled_df = labeled_df[labeled_df['label'] != -1].copy()
+    if labeled_df.empty:
+        print("No valid labeled setups found after filtering for label != -1. Exiting."); return
+    
+    sequences, static_features, labels = create_sequences_and_features(labeled_df)
+    if len(sequences) == 0:
+        print("No sequences were generated from the labeled data. Exiting."); return
+    
+    model, test_seq, test_static, test_setups = train_model(sequences, static_features, labels, labeled_df)
+    
+    equity_curve, trades_log = run_backtest(model, test_seq, test_static, test_setups)
+    
+    plot_backtest_results(equity_curve)
+    print("\n--- PyTorch Pipeline Finished ---")
 
 if __name__ == '__main__':
-    # --- Execution Guidance ---
-    # This script can be run from the command line or in a notebook like Google Colab.
+    parser = argparse.ArgumentParser(description="Run the full ML pipeline.")
+    parser.add_argument('all', nargs='?', help='Dummy argument to accept "all"')
+    parser.add_argument(
+        '--quick-test',
+        action='store_true',
+        help='Run the pipeline with a small subset of data for testing purposes.'
+    )
+    parser.add_argument(
+        '--skip-pre-check',
+        action='store_true',
+        help='(For developers) Skip the mandatory quick test pre-check before a full run.'
+    )
+    args = parser.parse_args()
 
-    if IN_COLAB:
-        print("--- Script loaded in Google Colab ---")
-        print("To run the pipeline, call the `run_pipeline()` function in a new cell.")
-        print("\nExample for a quick test run:")
-        print("run_pipeline(quick_test=True)")
-        print("\nExample for a full run:")
-        print("# Make sure your data is in Google Drive first.")
-        print("# run_pipeline(quick_test=False)")
-
+    if args.quick_test:
+        print("--- Running in Standalone Quick Test Mode ---")
+        run_pipeline(quick_test=True)
     else:
-        # Standard command-line execution
-        parser = argparse.ArgumentParser(description="Run the full ML pipeline.")
-        parser.add_argument(
-            '--quick-test',
-            action='store_true',
-            help='Run the pipeline with a small subset of data for testing purposes.'
-        )
-        parser.add_argument(
-            '--full-run',
-            action='store_true',
-            help='Run the full pipeline. A quick test pre-check will be run first.'
-        )
-        parser.add_argument(
-            '--skip-pre-check',
-            action='store_true',
-            help='(For developers) Skip the mandatory quick test pre-check before a full run.'
-        )
-        args = parser.parse_args()
-
-        if args.quick_test:
-            print("--- Running in Standalone Quick Test Mode ---")
-            run_pipeline(quick_test=True)
-        elif args.full_run:
-            pre_check_passed = False
-            if not args.skip_pre_check:
-                print("--- Running Mandatory Quick Test Pre-check ---")
-                try:
-                    run_pipeline(quick_test=True)
-                    print("\n--- Quick Test Pre-check PASSED ---\n")
-                    pre_check_passed = True
-                except Exception as e:
-                    print(f"\n--- Quick Test Pre-check FAILED: {e} ---\n")
-                    print("Aborting full run due to pre-check failure.")
-            
-            if args.skip_pre_check or pre_check_passed:
-                if args.skip_pre_check:
-                    print("--- Skipping Pre-check. Starting Full Run Directly ---")
-                else:
-                    print("\n--- Starting Full Run ---")
-                run_pipeline(quick_test=False)
-        else:
-            print("No run command specified. Use --quick-test or --full-run.")
-            parser.print_help()
+        # This is a full run, which requires a pre-check first
+        pre_check_passed = False
+        if not args.skip_pre_check:
+            print("--- Running Mandatory Quick Test Pre-check ---")
+            try:
+                run_pipeline(quick_test=True)
+                print("\n--- Quick Test Pre-check PASSED ---\n")
+                pre_check_passed = True
+            except Exception as e:
+                print(f"\n--- Quick Test Pre-check FAILED: {e} ---\n")
+                print("Aborting full run due to pre-check failure.")
+        
+        if args.skip_pre_check or pre_check_passed:
+            if args.skip_pre_check:
+                print("--- Skipping Pre-check. Starting Full Run Directly ---")
+            else:
+                print("\n--- Starting Full Run ---")
+            run_pipeline(quick_test=False)
