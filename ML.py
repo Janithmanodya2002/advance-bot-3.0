@@ -794,7 +794,7 @@ def run_pipeline(quick_test=False):
     if labeled_df.empty:
         print("No valid labeled setups found after filtering for label != -1. Exiting."); return
     
-    sequences, static_features, labels = create_sequences_and_features(labeled_df)
+    sequences, static_features, labels, _ = create_sequences_and_features(labeled_df)
     if len(sequences) == 0:
         print("No sequences were generated from the labeled data. Exiting."); return
     
