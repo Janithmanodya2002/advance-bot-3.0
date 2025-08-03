@@ -617,7 +617,7 @@ def train_model(sequences, static_features, labels, labeled_setups_df, loss_type
         criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
         
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     
     model_path = os.path.join(MODELS_DIR, 'pytorch_lstm_model.pth')
     os.makedirs(MODELS_DIR, exist_ok=True)
