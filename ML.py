@@ -8,6 +8,20 @@ import pyarrow.parquet as pq
 from binance.client import Client as BinanceClient
 import glob
 import keys
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+import concurrent.futures
+from multiprocessing import Pool
+from functools import partial
+from sklearn.utils.class_weight import compute_class_weight
+
+# --- PyTorch Imports ---
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 
 # --- Configuration ---
 DATA_DIR = "data/raw"
@@ -15,146 +29,90 @@ PROCESSED_DATA_DIR = "data/processed"
 MODELS_DIR = "models"
 SYMBOLS_FILE = "symbols.csv"
 SWING_WINDOW = 5
-LOOKBACK_CANDLES = 100 # From main.py config
-TRADE_EXPIRY_BARS = 96 # How many 15-min bars to wait for a result (1 day)
+LOOKBACK_CANDLES = 100
+TRADE_EXPIRY_BARS = 96
+SEQUENCE_LENGTH = 60
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Timezone definitions for trading sessions (in UTC)
 SESSIONS = {
     "Asia": (0, 8),
     "London": (7, 15),
     "New_York": (12, 20)
 }
 
-# --- Data Acquisition (Step 1) ---
+# --- Data Pipeline Functions ---
 
-def fetch_historical(client, symbol, interval=BinanceClient.KLINE_INTERVAL_15MINUTE, total_limit=20000):
-    """
-    Fetches historical klines from Binance, handling pagination to get more data.
-    """
+def fetch_historical_for_symbol(symbol, client, total_limit=20000):
+    print(f"Fetching data for {symbol}...")
     all_klines = []
-    limit = 1000  # Max limit per request
-    
+    limit = 1000
     while len(all_klines) < total_limit:
         try:
-            # If we have klines, fetch from before the oldest one
             end_time = all_klines[0][0] if all_klines else None
-            
-            klines = client.get_historical_klines(
-                symbol=symbol, 
-                interval=interval, 
-                limit=min(limit, total_limit - len(all_klines)),
-                end_str=end_time
-            )
-
-            # If no more klines are returned, break the loop
-            if not klines:
-                break
-
-            # Prepend new klines to maintain chronological order
+            klines = client.get_historical_klines(symbol=symbol, interval=BinanceClient.KLINE_INTERVAL_15MINUTE, limit=min(limit, total_limit - len(all_klines)), end_str=end_time)
+            if not klines: break
             all_klines = klines + all_klines
-            
-            print(f"  - Fetched {len(klines)} more candles for {symbol}. Total: {len(all_klines)}/{total_limit}")
-
         except Exception as e:
             print(f"Error fetching klines for {symbol}: {e}")
-            break # Exit on error
+            return symbol, None # Return symbol to identify failure
+    return symbol, all_klines
 
-    return all_klines
-
-
-def fetch_initial_data():
-    """
-    Fetches a large number of historical candles for each symbol
-    in symbols.csv and saves them.
-    """
-    print("Starting initial data acquisition...")
+def fetch_initial_data(sessions_dict):
+    print("Starting parallel initial data acquisition...")
     try:
         symbols = pd.read_csv(SYMBOLS_FILE, header=None)[0].tolist()
     except FileNotFoundError:
         print(f"Error: {SYMBOLS_FILE} not found.")
         return
-
+    
     client = BinanceClient(keys.api_mainnet, keys.secret_mainnet)
     
-    for symbol in symbols:
-        print(f"Fetching data for {symbol}...")
-        klines = fetch_historical(client, symbol, total_limit=20000) # Fetch 20,000 candles
-
-        if klines:
-            # Save to a file named after the total number of candles
-            filename = f"initial_{len(klines)}.parquet"
-            process_and_save_kline_data(klines, symbol, filename)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        # Create a future for each symbol download
+        future_to_symbol = {executor.submit(fetch_historical_for_symbol, symbol, client): symbol for symbol in symbols}
+        
+        for future in concurrent.futures.as_completed(future_to_symbol):
+            symbol, klines = future.result()
+            if klines:
+                print(f"  - Successfully fetched {len(klines)} candles for {symbol}")
+                filename = f"initial_{len(klines)}.parquet"
+                process_and_save_kline_data(klines, symbol, filename, sessions_dict)
+            else:
+                print(f"  - Failed to fetch data for {symbol}")
 
     print("\nInitial data acquisition complete.")
 
+def get_session(timestamp, sessions_dict):
+    if isinstance(timestamp, pd.Series): return timestamp.apply(lambda ts: _get_single_session(ts, sessions_dict))
+    else: return _get_single_session(timestamp, sessions_dict)
 
-# --- Data Loading and Initial Processing ---
-
-def get_session(timestamp):
-    """Determines the trading session(s) for a given timestamp."""
-    if isinstance(timestamp, pd.Series):
-        return timestamp.apply(lambda ts: _get_single_session(ts))
-    else:
-        return _get_single_session(timestamp)
-
-def _get_single_session(timestamp):
-    """Helper function to process a single timestamp."""
+def _get_single_session(timestamp, sessions_dict):
     utc_time = pd.to_datetime(timestamp, unit='ms').tz_localize('UTC')
     hour = utc_time.hour
-    active_sessions = [name for name, (start, end) in SESSIONS.items() if start <= hour <= end]
+    active_sessions = [name for name, (start, end) in sessions_dict.items() if start <= hour <= end]
     return ",".join(active_sessions) if active_sessions else "Inactive"
 
-def process_and_save_kline_data(klines, symbol, filename=None):
-    """Processes raw kline data and saves it to a Parquet file."""
-    if not klines:
-        print(f"No kline data to process for {symbol}.")
-        return
-    print(f"Processing and saving {len(klines)} candles for {symbol}...")
+def process_and_save_kline_data(klines, symbol, filename, sessions_dict):
+    if not klines: return
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
-    
-    # Keep the new taker volume column
     df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume', 'taker_buy_base_asset_volume']]
-    
-    # Coerce all numeric columns to numbers, handling potential errors
     numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base_asset_volume']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df['session'] = get_session(df['timestamp'])
+    for col in numeric_cols: df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['session'] = get_session(df['timestamp'], sessions_dict)
     save_data_to_parquet(df, symbol, filename)
 
-def save_data_to_parquet(df, symbol, filename=None):
-    """Saves the DataFrame to a Parquet file."""
-    if df is None or df.empty:
-        return
+def save_data_to_parquet(df, symbol, filename):
+    if df is None or df.empty: return
     symbol_dir = os.path.join(DATA_DIR, symbol)
     os.makedirs(symbol_dir, exist_ok=True)
-    if filename:
-        file_path = os.path.join(symbol_dir, filename)
-    else:
-        file_date = pd.to_datetime(df['timestamp'].iloc[-1], unit='ms').strftime('%Y-%m-%d')
-        file_path = os.path.join(symbol_dir, f"{file_date}.parquet")
-    print(f"  - Saving data for {symbol} to {file_path}")
+    file_path = os.path.join(symbol_dir, filename)
     table = pa.Table.from_pandas(df)
     pq.write_table(table, file_path)
 
-# --- Preprocessing and Labeling (Step 3) ---
-
 def load_raw_data_for_symbol(symbol):
-    """Loads all parquet files for a symbol and concatenates them."""
     symbol_dir = os.path.join(DATA_DIR, symbol)
-    
-    # Find any file starting with 'initial_'
-    initial_files = glob.glob(os.path.join(symbol_dir, "initial_*.parquet"))
-    
-    if initial_files:
-        # If there are multiple, prefer the one with the most candles (largest file)
-        files = [max(initial_files, key=os.path.getsize)]
-    else:
-        # Fallback to any other parquet files if no 'initial_' file is found
-        files = glob.glob(os.path.join(symbol_dir, "*.parquet"))
-
-    if not files:
-        return None
+    files = glob.glob(os.path.join(symbol_dir, "*.parquet"))
+    if not files: return None
     df = pd.concat([pd.read_parquet(f) for f in files])
     df.sort_values('timestamp', inplace=True)
     df.drop_duplicates(subset=['timestamp'], keep='first', inplace=True)
@@ -162,877 +120,397 @@ def load_raw_data_for_symbol(symbol):
     return df
 
 def get_swing_points_df(df, window=5):
-    """Identify swing points from a DataFrame."""
-    highs = df['high']
-    lows = df['low']
-
-    swing_highs = []
-    swing_lows = []
-
+    highs, lows = df['high'], df['low']
+    swing_highs, swing_lows = [], []
     for i in range(window, len(df) - window):
-        # Swing High
         is_swing_high = highs.iloc[i] > highs.iloc[i-window:i].max() and highs.iloc[i] > highs.iloc[i+1:i+window+1].max()
-        if is_swing_high:
-            swing_highs.append({'timestamp': df['timestamp'].iloc[i], 'price': highs.iloc[i]})
-
-        # Swing Low
+        if is_swing_high: swing_highs.append({'timestamp': df['timestamp'].iloc[i], 'price': highs.iloc[i]})
         is_swing_low = lows.iloc[i] < lows.iloc[i-window:i].min() and lows.iloc[i] < lows.iloc[i+1:i+window+1].min()
-        if is_swing_low:
-            swing_lows.append({'timestamp': df['timestamp'].iloc[i], 'price': lows.iloc[i]})
-
+        if is_swing_low: swing_lows.append({'timestamp': df['timestamp'].iloc[i], 'price': lows.iloc[i]})
     return pd.DataFrame(swing_highs), pd.DataFrame(swing_lows)
 
 def get_trend_df(swing_highs, swing_lows):
-    """Determine the trend based on swing points DataFrames."""
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "undetermined"
-    if swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]:
-        return "uptrend"
-    if swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]:
-        return "downtrend"
+    if len(swing_highs) < 2 or len(swing_lows) < 2: return "undetermined"
+    if swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]: return "uptrend"
+    if swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]: return "downtrend"
     return "undetermined"
 
 def get_fib_retracement(p1, p2, trend):
-    """Calculate Fibonacci retracement levels."""
     price_range = abs(p1 - p2)
     if trend == "downtrend":
-        golden_zone_start = p1 - (price_range * 0.5)
-        golden_zone_end = p1 - (price_range * 0.618)
-    else: # Uptrend
-        golden_zone_start = p1 + (price_range * 0.5)
-        golden_zone_end = p1 + (price_range * 0.618)
+        golden_zone_start, golden_zone_end = p1 - (price_range * 0.5), p1 - (price_range * 0.618)
+    else:
+        golden_zone_start, golden_zone_end = p1 + (price_range * 0.5), p1 + (price_range * 0.618)
     return (golden_zone_start + golden_zone_end) / 2
 
 def label_trade(df, entry_idx, sl_price, tp1_price, tp2_price, side):
-    """Labels a single trade based on future price action."""
     future_candles = df.iloc[entry_idx + 1 : entry_idx + 1 + TRADE_EXPIRY_BARS]
-
     tp1_hit = False
     for _, candle in future_candles.iterrows():
         if side == 'long':
-            if candle['low'] <= sl_price:
-                # If TP1 was hit before SL, it's a TP1 win. Otherwise, a loss.
-                return 1 if tp1_hit else 0
-            if candle['high'] >= tp2_price: return 2 # Win to TP2
-            if candle['high'] >= tp1_price:
-                tp1_hit = True # TP1 is hit, continue checking for TP2 or SL
+            if candle['low'] <= sl_price: return 1 if tp1_hit else 0
+            if candle['high'] >= tp2_price: return 2
+            if candle['high'] >= tp1_price: tp1_hit = True
         elif side == 'short':
-            if candle['high'] >= sl_price:
-                return 1 if tp1_hit else 0 # Loss
-            if candle['low'] <= tp2_price: return 2 # Win to TP2
-            if candle['low'] <= tp1_price:
-                tp1_hit = True # TP1 is hit
-
-    # If loop finishes
-    if tp1_hit:
-        return 1 # Exited at TP1 (or expired after hitting TP1)
-    return -1 # Trade expired without result
+            if candle['high'] >= sl_price: return 1 if tp1_hit else 0
+            if candle['low'] <= tp2_price: return 2
+            if candle['low'] <= tp1_price: tp1_hit = True
+    if tp1_hit: return 1
+    return -1
 
 def find_and_label_setups(df):
-    """Finds all potential trade setups and labels them."""
     labeled_setups = []
-
-    # Adding tqdm for a progress bar
     for i in tqdm(range(LOOKBACK_CANDLES, len(df) - TRADE_EXPIRY_BARS), desc="Finding Setups"):
-        if df['session'].iloc[i] == 'Inactive':
-            continue
-
+        if df['session'].iloc[i] == 'Inactive': continue
         current_klines_df = df.iloc[i - LOOKBACK_CANDLES : i]
         swing_highs, swing_lows = get_swing_points_df(current_klines_df, SWING_WINDOW)
-
-        if len(swing_highs) < 2 or len(swing_lows) < 2:
-            continue
-
+        if len(swing_highs) < 2 or len(swing_lows) < 2: continue
         trend = get_trend_df(swing_highs, swing_lows)
         setup = None
         if trend == 'downtrend':
-            last_swing_high_price = swing_highs.iloc[-1]['price']
-            last_swing_low_price = swing_lows.iloc[-1]['price']
-            # Ensure the last swing low is below the previous one for a confirmed downtrend setup
+            last_swing_high_price, last_swing_low_price = swing_highs.iloc[-1]['price'], swing_lows.iloc[-1]['price']
             if last_swing_low_price >= swing_lows.iloc[-2]['price']: continue
-
             entry_price = get_fib_retracement(last_swing_high_price, last_swing_low_price, trend)
             sl = last_swing_high_price
             tp1 = entry_price - (sl - entry_price)
             tp2 = entry_price - (sl - entry_price) * 2
-
-            # Find the actual candle index where the entry was triggered
             entry_candle_idx = -1
             for k in range(i, min(i + TRADE_EXPIRY_BARS, len(df))):
-                 if df['high'].iloc[k] >= entry_price:
-                     entry_candle_idx = k
-                     break
+                if df['high'].iloc[k] >= entry_price: entry_candle_idx = k; break
             if entry_candle_idx == -1: continue
-
             label = label_trade(df, entry_candle_idx, sl, tp1, tp2, 'short')
-            if label != -1:
-                setup = {
-                    'timestamp': df['timestamp'].iloc[i], 'side': 'short', 
-                    'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'label': label,
-                    'swing_high_price': last_swing_high_price, 'swing_low_price': last_swing_low_price
-                }
-
+            if label != -1: setup = {'timestamp': df['timestamp'].iloc[i], 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'label': label, 'swing_high_price': last_swing_high_price, 'swing_low_price': last_swing_low_price}
         elif trend == 'uptrend':
-            last_swing_high_price = swing_highs.iloc[-1]['price']
-            last_swing_low_price = swing_lows.iloc[-1]['price']
+            last_swing_high_price, last_swing_low_price = swing_highs.iloc[-1]['price'], swing_lows.iloc[-1]['price']
             if last_swing_high_price <= swing_highs.iloc[-2]['price']: continue
-
             entry_price = get_fib_retracement(last_swing_low_price, last_swing_high_price, trend)
             sl = last_swing_low_price
             tp1 = entry_price + (entry_price - sl)
             tp2 = entry_price + (entry_price - sl) * 2
-
             entry_candle_idx = -1
             for k in range(i, min(i + TRADE_EXPIRY_BARS, len(df))):
-                 if df['low'].iloc[k] <= entry_price:
-                     entry_candle_idx = k
-                     break
+                if df['low'].iloc[k] <= entry_price: entry_candle_idx = k; break
             if entry_candle_idx == -1: continue
-
             label = label_trade(df, entry_candle_idx, sl, tp1, tp2, 'long')
-            if label != -1:
-                setup = {
-                    'timestamp': df['timestamp'].iloc[i], 'side': 'long',
-                    'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'label': label,
-                    'swing_high_price': last_swing_high_price, 'swing_low_price': last_swing_low_price
-                }
-
-        if setup:
-            labeled_setups.append(setup)
-
+            if label != -1: setup = {'timestamp': df['timestamp'].iloc[i], 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'label': label, 'swing_high_price': last_swing_high_price, 'swing_low_price': last_swing_low_price}
+        if setup: labeled_setups.append(setup)
     return pd.DataFrame(labeled_setups)
 
-from multiprocessing import Pool
-
-def process_symbol_for_labeling(symbol):
-    """Helper function to process and label setups for a single symbol."""
-    print(f"Processing {symbol}...")
+def process_symbol_for_labeling(symbol, sessions_dict):
     df = load_raw_data_for_symbol(symbol)
-    if df is None or df.empty:
-        print(f"  - No raw data found for {symbol}. Skipping.")
-        return None
-
+    if df is None or df.empty: return None
+    df['session'] = get_session(df['timestamp'], sessions_dict)
     labeled_setups = find_and_label_setups(df)
     if not labeled_setups.empty:
         labeled_setups['symbol'] = symbol
-        print(f"  - Found and labeled {len(labeled_setups)} setups for {symbol}.")
         return labeled_setups
-    else:
-        print(f"  - No valid setups found for {symbol}.")
-        return None
+    return None
 
-def main_preprocess():
-    """Main function for preprocessing and labeling, using multiprocessing."""
-    print("Starting preprocessing and labeling...")
+def main_preprocess(sessions_dict, chunk_size=4):
+    print("Starting robust preprocessing and labeling with chunking...")
     os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
-
+    
     try:
         symbols = pd.read_csv(SYMBOLS_FILE, header=None)[0].tolist()
     except FileNotFoundError:
-        print(f"Error: {SYMBOLS_FILE} not found.")
+        print(f"Error: {SYMBOLS_FILE} not found."); return
+
+    worker_func = partial(process_symbol_for_labeling, sessions_dict=sessions_dict)
+    symbol_chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+    
+    for i, chunk in enumerate(symbol_chunks):
+        chunk_file_path = os.path.join(PROCESSED_DATA_DIR, f"labeled_chunk_{i+1}.parquet")
+        if os.path.exists(chunk_file_path):
+            print(f"--- Chunk {i+1}/{len(symbol_chunks)} already processed. Skipping. ---")
+            continue
+            
+        print(f"--- Processing Chunk {i+1}/{len(symbol_chunks)}: {chunk} ---")
+        with Pool() as pool:
+            results = pool.map(worker_func, chunk)
+        
+        all_labeled_data = [res for res in results if res is not None]
+        
+        if all_labeled_data:
+            chunk_df = pd.concat(all_labeled_data, ignore_index=True)
+            chunk_df.to_parquet(chunk_file_path)
+            print(f"Saved chunk {i+1} to {chunk_file_path}")
+        else:
+            print(f"No labeled data generated for chunk {i+1}.")
+
+    print("\n--- Combining all processed chunks ---")
+    all_chunk_files = glob.glob(os.path.join(PROCESSED_DATA_DIR, "labeled_chunk_*.parquet"))
+    if not all_chunk_files:
+        print("No chunk files found to combine. Preprocessing did not generate any labeled data.")
+        # Create an empty placeholder file so the pipeline doesn't fail on read
+        pd.DataFrame().to_parquet(os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet"))
         return
-
-    # Use multiprocessing.Pool to process symbols in parallel
-    with Pool() as pool:
-        results = pool.map(process_symbol_for_labeling, symbols)
-
-    # Filter out None results
-    all_labeled_data = [res for res in results if res is not None]
-
-    if all_labeled_data:
-        final_df = pd.concat(all_labeled_data, ignore_index=True)
-        save_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
-        final_df.to_parquet(save_path)
-        print(f"Preprocessing complete. Labeled data saved to {save_path}")
-    else:
-        print("No labeled data was generated.")
-
-# --- Feature Engineering (Step 3) ---
+        
+    combined_df = pd.concat([pd.read_parquet(f) for f in all_chunk_files], ignore_index=True)
+    final_save_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
+    combined_df.to_parquet(final_save_path)
+    print(f"All chunks combined. Final labeled data saved to {final_save_path}")
 
 def calculate_atr(df, period=14):
-    """Calculates the Average True Range (ATR)."""
     high_low = df['high'] - df['low']
     high_close = np.abs(df['high'] - df['close'].shift())
     low_close = np.abs(df['low'] - df['close'].shift())
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    return atr
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def calculate_rsi(df, period=14):
-    """Calculates the Relative Strength Index (RSI)."""
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    
-    # Avoid division by zero
     rs = gain / loss
-    rs = rs.replace([np.inf, -np.inf], np.nan) # Handle infinities if loss is 0
-
-    rsi = 100 - (100 / (1 + rs))
-    
-    # When gain and loss are both 0, RSI is NaN. A neutral 50 is a common treatment.
-    rsi.fillna(50, inplace=True)
-    
-    return rsi
+    return (100 - (100 / (1 + rs))).fillna(50)
 
 def calculate_macd(df, fast_period=12, slow_period=26, signal_period=9):
-    """Calculates the Moving Average Convergence Divergence (MACD)."""
     fast_ema = df['close'].ewm(span=fast_period, adjust=False).mean()
     slow_ema = df['close'].ewm(span=slow_period, adjust=False).mean()
     macd = fast_ema - slow_ema
     signal = macd.ewm(span=signal_period, adjust=False).mean()
-    return macd, signal
-
-def calculate_adx(df, period=14):
-    """Calculates the Average Directional Index (ADX)."""
-    df['high_diff'] = df['high'].diff()
-    df['low_diff'] = df['low'].diff()
-    df['plus_dm'] = np.where((df['high_diff'] > df['low_diff']) & (df['high_diff'] > 0), df['high_diff'], 0)
-    df['minus_dm'] = np.where((df['low_diff'] > df['high_diff']) & (df['low_diff'] > 0), df['low_diff'], 0)
-
-    # ATR is needed for ADX calculation
-    high_low = df['high'] - df['low']
-    high_close = np.abs(df['high'] - df['close'].shift())
-    low_close = np.abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-
-    plus_di = 100 * (df['plus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr)
-    minus_di = 100 * (df['minus_dm'].ewm(alpha=1/period, adjust=False).mean() / atr)
-
-    dx = 100 * (np.abs(plus_di - minus_di) / (plus_di + minus_di))
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-
-    # Clean up temporary columns
-    df.drop(['high_diff', 'low_diff', 'plus_dm', 'minus_dm'], axis=1, inplace=True)
-    
-    return adx.fillna(0) # Return ADX, fill initial NaNs with 0
+    return macd, signal, macd - signal
 
 def calculate_bollinger_bands(df, window=20, num_std_dev=2):
-    """Calculates Bollinger Bands."""
     rolling_mean = df['close'].rolling(window=window).mean()
     rolling_std = df['close'].rolling(window=window).std()
     upper_band = rolling_mean + (rolling_std * num_std_dev)
     lower_band = rolling_mean - (rolling_std * num_std_dev)
     return upper_band, lower_band
 
-def calculate_ichimoku_cloud(df):
-    """Calculates Ichimoku Cloud components."""
-    # Tenkan-sen (Conversion Line)
-    tenkan_sen_high = df['high'].rolling(window=9).max()
-    tenkan_sen_low = df['low'].rolling(window=9).min()
-    tenkan_sen = (tenkan_sen_high + tenkan_sen_low) / 2
-
-    # Kijun-sen (Base Line)
-    kijun_sen_high = df['high'].rolling(window=26).max()
-    kijun_sen_low = df['low'].rolling(window=26).min()
-    kijun_sen = (kijun_sen_high + kijun_sen_low) / 2
-
-    # Senkou Span A (Leading Span A)
-    senkou_span_a = ((tenkan_sen + kijun_sen) / 2).shift(26)
-
-    # Senkou Span B (Leading Span B)
-    senkou_span_b_high = df['high'].rolling(window=52).max()
-    senkou_span_b_low = df['low'].rolling(window=52).min()
-    senkou_span_b = ((senkou_span_b_high + senkou_span_b_low) / 2).shift(26)
-
-    # Chikou Span (Lagging Span)
-    chikou_span = df['close'].shift(-26)
-
-    return tenkan_sen, kijun_sen, senkou_span_a, senkou_span_b, chikou_span
-
-def engineer_features():
-    """Loads labeled trades and engineers features for the ML model."""
-    print("Starting feature engineering...")
-    try:
-        labeled_df = pd.read_parquet(os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet"))
-    except FileNotFoundError:
-        print("Error: labeled_trades.parquet not found. Please run main_preprocess() first.")
-        return
-
-    # Load all raw data into a dictionary for quick access
+def create_sequences_and_features(labeled_setups_df):
+    print("Starting sequence and feature generation...")
     all_raw_data = {}
-    symbols = labeled_df['symbol'].unique()
-    for symbol in symbols:
+    for symbol in tqdm(labeled_setups_df['symbol'].unique(), desc="Loading Raw Data"):
         df = load_raw_data_for_symbol(symbol)
         if df is not None:
-            # Pre-calculate indicators for the whole series to speed up lookups
             df['atr'] = calculate_atr(df)
             df['rsi'] = calculate_rsi(df)
-            df['macd'], df['macd_signal'] = calculate_macd(df)
-            df['adx'] = calculate_adx(df)
+            df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(df)
             df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
-            df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
+            df.set_index('timestamp', inplace=True)
+            all_raw_data[symbol] = df
             
-            for p in [20, 50, 100]:
-                df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
-            
-            df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
-            
-            df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
-
-            df_4h = df['close'].resample('4h').ohlc()
-            df_4h['rsi'] = calculate_rsi(df_4h)
-            df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
-            df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
-            
-            all_raw_data[symbol] = {'15m': df, '4h': df_4h}
-
-    # --- Volatility Regime Calculation ---
-    all_volatility = pd.concat([data['15m']['volatility_50'] for symbol, data in all_raw_data.items() if 'volatility_50' in data['15m'] and not data['15m'].empty]).dropna()
-    if not all_volatility.empty:
-        vol_low_threshold, vol_high_threshold = all_volatility.quantile([0.33, 0.67])
-    else:
-        vol_low_threshold, vol_high_threshold = 0, 0
-
-    feature_list = []
-    for _, row in tqdm(labeled_df.iterrows(), total=labeled_df.shape[0], desc="Engineering Features"):
-        symbol = row['symbol']
-        timestamp = row['timestamp']
-
-        if symbol not in all_raw_data:
-            continue
-        
-        data_dict = all_raw_data[symbol]
-        raw_df_15m = data_dict['15m']
-        raw_df_4h = data_dict['4h']
-
-        setup_timestamp_dt = pd.to_datetime(timestamp, unit='ms')
-
+    sequence_list, static_list, label_list = [], [], []
+    for _, row in tqdm(labeled_setups_df.iterrows(), total=labeled_setups_df.shape[0], desc="Generating Sequences"):
+        raw_df = all_raw_data.get(row['symbol'])
+        if raw_df is None: continue
         try:
-            setup_candle = raw_df_15m.loc[setup_timestamp_dt]
-            htf_candle = raw_df_4h.asof(setup_timestamp_dt)
-        except KeyError:
-            continue
+            setup_idx_loc = raw_df.index.get_loc(row['timestamp'])
+        except KeyError: continue
+        if setup_idx_loc < SEQUENCE_LENGTH: continue
+        
+        sequence_df = raw_df.iloc[setup_idx_loc - SEQUENCE_LENGTH:setup_idx_loc]
+        last_close = sequence_df['close'].iloc[-1]
+        
+        seq_features = pd.DataFrame()
+        # Price and Volume Features (Normalized)
+        seq_features['open'] = sequence_df['open'] / last_close - 1
+        seq_features['high'] = sequence_df['high'] / last_close - 1
+        seq_features['low'] = sequence_df['low'] / last_close - 1
+        seq_features['close'] = sequence_df['close'] / last_close - 1
+        seq_features['volume'] = (sequence_df['volume'] - sequence_df['volume'].mean()) / (sequence_df['volume'].std() + 1e-8)
+        
+        # Indicator Features (Normalized)
+        seq_features['rsi'] = (sequence_df['rsi'] - 50) / 50
+        seq_features['atr'] = sequence_df['atr'] / last_close
+        seq_features['macd_hist'] = sequence_df['macd_hist'] / last_close # Normalize by price
+        seq_features['bb_width'] = (sequence_df['bb_upper'] - sequence_df['bb_lower']) / last_close # Normalize by price
+        seq_features['bb_pos'] = (sequence_df['close'] - sequence_df['bb_lower']) / (sequence_df['bb_upper'] - sequence_df['bb_lower'] + 1e-8)
 
-        features = {}
-        features['symbol'], features['timestamp'], features['side'] = symbol, timestamp, row['side']
-        features['entry_price'], features['sl'], features['tp1'], features['tp2'] = row['entry_price'], row['sl'], row['tp1'], row['tp2']
-        features['label'] = row['label']
-
+        sequence_list.append(seq_features.values)
+        
+        static_features = {}
+        static_features['side_long'] = 1 if row['side'] == 'long' else 0
+        static_features['side_short'] = 1 if row['side'] == 'short' else 0
         swing_height = row['swing_high_price'] - row['swing_low_price']
         if swing_height > 0:
-            if row['side'] == 'long':
-                features['golden_zone_ratio'] = (row['entry_price'] - row['swing_low_price']) / swing_height
-            else:
-                features['golden_zone_ratio'] = (row['swing_high_price'] - row['entry_price']) / swing_height
-            features['sl_pct'] = abs(row['entry_price'] - row['sl']) / swing_height
-            features['tp1_pct'] = abs(row['tp1'] - row['entry_price']) / swing_height
-            features['tp2_pct'] = abs(row['tp2'] - row['entry_price']) / swing_height
+            if row['side'] == 'long': static_features['golden_zone_ratio'] = (row['entry_price'] - row['swing_low_price']) / swing_height
+            else: static_features['golden_zone_ratio'] = (row['swing_high_price'] - row['entry_price']) / swing_height
+            static_features['sl_pct_of_swing'] = abs(row['entry_price'] - row['sl']) / swing_height
         else:
-            features['golden_zone_ratio'], features['sl_pct'], features['tp1_pct'], features['tp2_pct'] = np.nan, np.nan, np.nan, np.nan
-
-        candle_range = setup_candle['high'] - setup_candle['low']
-        if candle_range > 0:
-            features['body_to_range_ratio'] = abs(setup_candle['open'] - setup_candle['close']) / candle_range
-            features['upper_wick_ratio'] = (setup_candle['high'] - max(setup_candle['open'], setup_candle['close'])) / candle_range
-            features['lower_wick_ratio'] = (min(setup_candle['open'], setup_candle['close']) - setup_candle['low']) / candle_range
-        else:
-            features['body_to_range_ratio'], features['upper_wick_ratio'], features['lower_wick_ratio'] = 0, 0, 0
-
-        try:
-            setup_idx_loc = raw_df_15m.index.get_loc(setup_timestamp_dt)
-            for n in range(1, 4):
-                prev_candle = raw_df_15m.iloc[setup_idx_loc - n]
-                prev_range = prev_candle['high'] - prev_candle['low']
-                if prev_range > 0:
-                    features[f'body_to_range_ratio_t-{n}'] = abs(prev_candle['open'] - prev_candle['close']) / prev_range
-                    features[f'upper_wick_ratio_t-{n}'] = (prev_candle['high'] - max(prev_candle['open'], prev_candle['close'])) / prev_range
-                    features[f'lower_wick_ratio_t-{n}'] = (min(prev_candle['open'], prev_candle['close']) - prev_candle['low']) / prev_range
-                else:
-                    features[f'body_to_range_ratio_t-{n}'] = 0
-                    features[f'upper_wick_ratio_t-{n}'] = 0
-                    features[f'lower_wick_ratio_t-{n}'] = 0
-        except (KeyError, IndexError):
-            # If we can't find the candle or there aren't enough previous ones, fill with 0
-            for n in range(1, 4):
-                features[f'body_to_range_ratio_t-{n}'] = 0
-                features[f'upper_wick_ratio_t-{n}'] = 0
-                features[f'lower_wick_ratio_t-{n}'] = 0
+            static_features['golden_zone_ratio'], static_features['sl_pct_of_swing'] = 0, 0
         
-        # Session One-Hot Encoding
-        session_str = setup_candle['session']
-        features['is_asia'] = 1 if 'Asia' in session_str else 0
-        features['is_london'] = 1 if 'London' in session_str else 0
-        features['is_new_york'] = 1 if 'New_York' in session_str else 0
+        static_list.append(list(static_features.values()))
+        label_list.append(row['label'])
         
-        # Market Context Features (from pre-calculated values)
-        features['atr'] = setup_candle['atr']
-        features['rsi'] = setup_candle['rsi']
-        features['macd_diff'] = setup_candle['macd'] - setup_candle['macd_signal']
-        features['adx'] = setup_candle['adx']
-        for p in [20, 50, 100]:
-            features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
-        
-        # Bollinger Bands
-        features['bb_upper'] = setup_candle['bb_upper']
-        features['bb_lower'] = setup_candle['bb_lower']
+    sequences_np, static_np, labels_np = np.array(sequence_list), np.array(static_list), np.array(label_list)
+    return sequences_np, static_np, labels_np
 
-        # Ichimoku Cloud
-        features['tenkan_sen'] = setup_candle['tenkan_sen']
-        features['kijun_sen'] = setup_candle['kijun_sen']
-        features['senkou_span_a'] = setup_candle['senkou_span_a']
-        features['senkou_span_b'] = setup_candle['senkou_span_b']
-        features['chikou_span'] = setup_candle['chikou_span']
+class LSTMModel(nn.Module):
+    def __init__(self, sequence_input_size, static_input_size, lstm_hidden_size=50, num_classes=3):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(sequence_input_size, lstm_hidden_size, batch_first=True)
+        self.fc1 = nn.Linear(lstm_hidden_size + static_input_size, 64)
+        self.dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(64, num_classes)
+        self.relu = nn.ReLU()
 
-        # Higher-Timeframe Context
-        features['rsi_4h'] = htf_candle['rsi']
-        features['macd_diff_4h'] = htf_candle['macd_diff']
+    def forward(self, sequence_data, static_data):
+        lstm_out, _ = self.lstm(sequence_data)
+        lstm_out = lstm_out[:, -1, :]
+        combined = torch.cat((lstm_out, static_data), dim=1)
+        x = self.relu(self.fc1(combined))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
 
-        # Symbol-Level Features
-        features['liquidity_proxy'] = setup_candle['liquidity_proxy']
-
-        # New Taker Volume Ratio
-        if 'taker_buy_base_asset_volume' in setup_candle and setup_candle['volume'] > 0:
-            features['taker_volume_ratio'] = setup_candle['taker_buy_base_asset_volume'] / setup_candle['volume']
-        else:
-            features['taker_volume_ratio'] = 0.5
-
-        # New Volatility Regime
-        vol = setup_candle['volatility_50']
-        features['vol_regime_low'] = 1 if vol < vol_low_threshold else 0
-        features['vol_regime_medium'] = 1 if vol_low_threshold <= vol < vol_high_threshold else 0
-        features['vol_regime_high'] = 1 if vol >= vol_high_threshold else 0
-
-        feature_list.append(features)
-
-    if not feature_list:
-        print("No features were generated.")
-        return
-
-    # --- Volatility Regime Calculation ---
-    # First, collect all volatility values to determine global regimes
-    all_volatility = pd.concat([data['15m']['volatility_50'] for data in all_raw_data.values()]).dropna()
-    vol_low_threshold, vol_high_threshold = all_volatility.quantile([0.33, 0.67])
+def train_model(sequences, static_features, labels, labeled_setups_df):
+    print("\n--- Starting PyTorch Model Training ---")
     
-    # --- Feature List Generation ---
-    feature_list = []
-    for _, row in tqdm(labeled_df.iterrows(), total=labeled_df.shape[0], desc="Engineering Features"):
-        # ... (existing setup candle lookup)
-        
-        # --- Calculate Features ---
-        # ... (existing features)
-        
-        # New Taker Volume Ratio
-        if setup_candle['volume'] > 0:
-            features['taker_volume_ratio'] = setup_candle.get('taker_buy_base_asset_volume', 0) / setup_candle['volume']
-        else:
-            features['taker_volume_ratio'] = 0.5 # Neutral value
-
-        # New Volatility Regime
-        vol = setup_candle['volatility_50']
-        if vol < vol_low_threshold:
-            features['vol_regime'] = 'Low'
-        elif vol < vol_high_threshold:
-            features['vol_regime'] = 'Medium'
-        else:
-            features['vol_regime'] = 'High'
-
-        feature_list.append(features)
-
-    # Create the final feature DataFrame
-    features_df = pd.DataFrame(feature_list)
+    indices = np.arange(len(sequences))
     
-    # --- Post-computation Feature Creation ---
-    # One-hot encode volatility regime
-    features_df = pd.get_dummies(features_df, columns=['vol_regime'], prefix='vol')
-
-    # Interaction Feature: ATR x Body Ratio
-    # This must be done after the main loop and after body_to_range_ratio is computed.
-    if 'atr' in features_df.columns and 'body_to_range_ratio' in features_df.columns:
-        features_df['atr_x_body_ratio'] = features_df['atr'] * features_df['body_to_range_ratio']
-
-    print(f"Generated {len(features_df)} total feature vectors before cleaning.")
+    X_seq_train_val, X_seq_test, X_static_train_val, X_static_test, y_train_val, y_test, _, test_indices = train_test_split(
+        sequences, static_features, labels, indices, test_size=0.20, shuffle=False
+    )
     
-    # Drop any rows that still have NaNs for any reason (e.g. from lookback periods)
-    features_df.dropna(inplace=True) 
-    print(f"Feature vectors remaining after final dropna: {len(features_df)}")
-
-    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
+    val_size_relative = 0.10 / 0.80
+    X_seq_train, X_seq_val, X_static_train, X_static_val, y_train, y_val = train_test_split(
+        X_seq_train_val, X_static_train_val, y_train_val, test_size=val_size_relative, shuffle=False
+    )
     
-    # --- Chunking Logic ---
-    chunk_size = 25000
-    num_chunks = int(np.ceil(len(features_df) / chunk_size))
+    test_setups_df = labeled_setups_df.iloc[test_indices]
     
-    # Clean up old single file if it exists
-    old_file_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
-    if os.path.exists(old_file_path):
-        os.remove(old_file_path)
-
-    for i in range(num_chunks):
-        start_idx = i * chunk_size
-        end_idx = start_idx + chunk_size
-        chunk_df = features_df.iloc[start_idx:end_idx]
-        
-        save_path = os.path.join(PROCESSED_DATA_DIR, f"features_part_{i+1}.parquet")
-        chunk_df.to_parquet(save_path)
-        print(f"Saved chunk {i+1}/{num_chunks} to {save_path}")
-
-    print(f"Feature engineering complete. Generated {len(features_df)} feature vectors in {num_chunks} chunks.")
-
-
-def generate_features_for_live_setup(klines_df, setup_info, feature_columns, vol_thresholds=None):
-    """
-    Generates a feature vector for a single, live trade setup.
-    `klines_df` should be a DataFrame of recent klines.
-    `setup_info` is a dict with trade parameters.
-    `feature_columns` is the list of columns the model was trained on.
-    `vol_thresholds` is a tuple (low_thresh, high_thresh) loaded from the model artifact.
-    """
-    df = klines_df.copy()
-
-    # --- Pre-calculate all indicators ---
-    df['atr'] = calculate_atr(df)
-    df['rsi'] = calculate_rsi(df)
-    df['macd'], df['macd_signal'] = calculate_macd(df)
-    df['adx'] = calculate_adx(df)
-    df['bb_upper'], df['bb_lower'] = calculate_bollinger_bands(df)
-    df['tenkan_sen'], df['kijun_sen'], df['senkou_span_a'], df['senkou_span_b'], df['chikou_span'] = calculate_ichimoku_cloud(df)
-    for p in [20, 50, 100]:
-        df[f'volatility_{p}'] = df['close'].pct_change().rolling(window=p).std()
-    df['liquidity_proxy'] = df['volume'].rolling(window=96).mean()
-
-    df.set_index(pd.to_datetime(df['timestamp'], unit='ms'), inplace=True)
-
-    df_4h = df['close'].resample('4h').ohlc()
-    df_4h['rsi'] = calculate_rsi(df_4h)
-    df_4h['macd'], df_4h['macd_signal'] = calculate_macd(df_4h)
-    df_4h['macd_diff'] = df_4h['macd'] - df_4h['macd_signal']
+    X_seq_train_t = torch.tensor(X_seq_train, dtype=torch.float32)
+    X_static_train_t = torch.tensor(X_static_train, dtype=torch.float32)
+    y_train_t = torch.tensor(y_train, dtype=torch.long)
     
-    setup_candle = df.iloc[-1]
-    htf_candle = df_4h.asof(df.index[-1])
+    X_seq_val_t = torch.tensor(X_seq_val, dtype=torch.float32).to(DEVICE)
+    X_static_val_t = torch.tensor(X_static_val, dtype=torch.float32).to(DEVICE)
+    y_val_t = torch.tensor(y_val, dtype=torch.long).to(DEVICE)
 
-    features = {}
+    X_seq_test_t = torch.tensor(X_seq_test, dtype=torch.float32).to(DEVICE)
+    X_static_test_t = torch.tensor(X_static_test, dtype=torch.float32).to(DEVICE)
+    y_test_t = torch.tensor(y_test, dtype=torch.long).to(DEVICE)
 
-    # Price & Strategy Features
-    swing_height = setup_info['swing_high_price'] - setup_info['swing_low_price']
-    if swing_height > 0:
-        features['golden_zone_ratio'] = (setup_info['entry_price'] - (setup_info['swing_low_price'] if setup_info['side'] == 'long' else setup_info['swing_high_price'])) / swing_height
-        features['sl_pct'] = abs(setup_info['entry_price'] - setup_info['sl']) / swing_height
-        features['tp1_pct'] = abs(setup_info['tp1'] - setup_info['entry_price']) / swing_height
-        features['tp2_pct'] = abs(setup_info['tp2'] - setup_info['entry_price']) / swing_height
-    else:
-        features['golden_zone_ratio'], features['sl_pct'], features['tp1_pct'], features['tp2_pct'] = np.nan, np.nan, np.nan, np.nan
+    train_dataset = TensorDataset(X_seq_train_t, X_static_train_t, y_train_t)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-    # Price Action & Pattern Sequence
-    candle_range = setup_candle['high'] - setup_candle['low']
-    features['body_to_range_ratio'] = abs(setup_candle['open'] - setup_candle['close']) / candle_range if candle_range > 0 else 0
-    features['upper_wick_ratio'] = (setup_candle['high'] - max(setup_candle['open'], setup_candle['close'])) / candle_range if candle_range > 0 else 0
-    features['lower_wick_ratio'] = (min(setup_candle['open'], setup_candle['close']) - setup_candle['low']) / candle_range if candle_range > 0 else 0
+    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
+    print(f"Using class weights: {class_weights}")
+
+    model = LSTMModel(X_seq_train.shape[2], X_static_train.shape[1]).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    for n in range(1, 4):
-        if len(df) > n:
-            prev_candle = df.iloc[-1-n]
-            prev_range = prev_candle['high'] - prev_candle['low']
-            features[f'body_to_range_ratio_t-{n}'] = abs(prev_candle['open'] - prev_candle['close']) / prev_range if prev_range > 0 else 0
-            features[f'upper_wick_ratio_t-{n}'] = (prev_candle['high'] - max(prev_candle['open'], prev_candle['close'])) / prev_range if prev_range > 0 else 0
-            features[f'lower_wick_ratio_t-{n}'] = (min(prev_candle['open'], prev_candle['close']) - prev_candle['low']) / prev_range if prev_range > 0 else 0
-        else:
-            features[f'body_to_range_ratio_t-{n}'], features[f'upper_wick_ratio_t-{n}'], features[f'lower_wick_ratio_t-{n}'] = 0, 0, 0
-
-    # Session
-    session_str = get_session(setup_candle['timestamp'])
-    features['is_asia'], features['is_london'], features['is_new_york'] = (1 if s in session_str else 0 for s in ['Asia', 'London', 'New_York'])
-
-    # Context Features
-    features['atr'], features['rsi'], features['macd_diff'], features['adx'] = setup_candle['atr'], setup_candle['rsi'], setup_candle['macd'] - setup_candle['macd_signal'], setup_candle['adx']
-    for p in [20, 50, 100]:
-        features[f'volatility_{p}'] = setup_candle[f'volatility_{p}']
-    features['bb_upper'], features['bb_lower'] = setup_candle['bb_upper'], setup_candle['bb_lower']
-    features['tenkan_sen'], features['kijun_sen'], features['senkou_span_a'], features['senkou_span_b'], features['chikou_span'] = setup_candle['tenkan_sen'], setup_candle['kijun_sen'], setup_candle['senkou_span_a'], setup_candle['senkou_span_b'], setup_candle['chikou_span']
-    features['rsi_4h'], features['macd_diff_4h'] = htf_candle['rsi'], htf_candle['macd_diff']
-    features['liquidity_proxy'] = setup_candle['liquidity_proxy']
-    
-    # New Features
-    features['taker_volume_ratio'] = (setup_candle.get('taker_buy_base_asset_volume', 0) / setup_candle['volume']) if setup_candle['volume'] > 0 else 0.5
-    
-    if vol_thresholds:
-        low_thresh, high_thresh = vol_thresholds
-    else: # Fallback for testing or if not provided
-        low_thresh, high_thresh = df['volatility_50'].quantile([0.33, 0.67])
-        
-    vol = setup_candle['volatility_50']
-    features['vol_regime_low'] = 1 if vol < low_thresh else 0
-    features['vol_regime_medium'] = 1 if low_thresh <= vol < high_thresh else 0
-    features['vol_regime_high'] = 1 if vol >= high_thresh else 0
-
-    features['atr_x_body_ratio'] = features['atr'] * features['body_to_range_ratio']
-    features['side_long'] = 1 if setup_info['side'] == 'long' else 0
-
-    feature_vector = pd.DataFrame([features])
-    feature_vector = feature_vector[feature_columns]
-    feature_vector.fillna(0, inplace=True)
-    
-    return feature_vector
-
-
-import joblib
-from tqdm.auto import tqdm
-from datetime import datetime
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-
-import lightgbm as lgb
-import xgboost as xgb
-import optuna
-from sklearn.model_selection import TimeSeriesSplit, train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.calibration import CalibratedClassifierCV, CalibrationDisplay
-
-
-# --- Model Training (Step 4) ---
-
-def _run_hyperparameter_search(X_train, y_train, X_val, y_val, model_type='lgbm'):
-    """Helper to run Optuna study for a given model type."""
-    
-    def objective(trial):
-        if model_type == 'lgbm':
-            params = {
-                'objective': 'multiclass',
-                'num_class': 3,
-                'metric': 'multi_logloss',
-                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-                'num_leaves': trial.suggest_int('num_leaves', 20, 300),
-                'max_depth': trial.suggest_int('max_depth', 3, 12),
-                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-                'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 1.0, log=True),
-                'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 1.0, log=True),
-                'random_state': 42,
-                'n_jobs': -1,
-            }
-            model = lgb.LGBMClassifier(**params)
-        else: # xgb
-            params = {
-                'objective': 'multi:softprob',
-                'num_class': 3,
-                'eval_metric': 'mlogloss',
-                'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-                'learning_rate': trial.suggest_float('learning_rate', 1e-3, 0.1, log=True),
-                'max_depth': trial.suggest_int('max_depth', 3, 10),
-                'subsample': trial.suggest_float('subsample', 0.5, 1.0),
-                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
-                'gamma': trial.suggest_float('gamma', 1e-8, 1.0, log=True),
-                'random_state': 42,
-                'n_jobs': -1,
-            }
-            model = xgb.XGBClassifier(**params)
-
-        class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-        sample_weights = y_train.map(dict(zip(np.unique(y_train), class_weights)))
-        
-        model.fit(X_train, y_train, sample_weight=sample_weights)
-        y_pred = model.predict(X_val)
-        # We optimize for F1 score of the minority class (TP2)
-        return f1_score(y_val, y_pred, labels=[2], average='macro')
-
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=50) # Number of trials can be adjusted
-    print(f"Best {model_type.upper()} params: {study.best_params}")
-    return study.best_params
-
-def train_model():
-    """Loads features, runs hyperparameter search, trains an ensemble, calibrates, and saves."""
-    print("Starting model training...")
-    try:
-        feature_files = glob.glob(os.path.join(PROCESSED_DATA_DIR, "features_part_*.parquet"))
-        if not feature_files: raise FileNotFoundError("No feature chunk files found.")
-        
-        df_list = [pd.read_parquet(f) for f in feature_files]
-        features_df = pd.concat(df_list, ignore_index=True)
-        features_df.sort_values('timestamp', inplace=True)
-        features_df.reset_index(drop=True, inplace=True)
-        print(f"Loaded {len(features_df)} features from {len(feature_files)} chunks.")
-        
-    except FileNotFoundError:
-        print("Error: No feature chunk files found. Please run engineer_features() first.")
-        return
-
-    if features_df.empty:
-        print("Feature set is empty. Cannot train model.")
-        return
-
-    # --- Data Preparation ---
-    feature_columns = [col for col in features_df.columns if col not in ['symbol', 'timestamp', 'side', 'entry_price', 'sl', 'tp1', 'tp2', 'label']]
-    X = features_df[feature_columns]
-    y = features_df['label']
-
-    # Time-based Split: 60% train, 20% validation (for Optuna), 20% test
-    n_samples = len(X)
-    train_end = int(n_samples * 0.6)
-    val_end = int(n_samples * 0.8)
-    X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
-    X_val, y_val = X.iloc[train_end:val_end], y.iloc[train_end:val_end]
-    X_test, y_test = X.iloc[val_end:], y.iloc[val_end:]
-
-    # Combine train and validation for final model training
-    X_train_full, y_train_full = X.iloc[:val_end], y.iloc[:val_end]
-    
-    print(f"Train shape: {X_train.shape}, Val shape: {X_val.shape}, Test shape: {X_test.shape}")
-
-    # --- Hyperparameter Search ---
-    print("\n--- Running Hyperparameter Search for LightGBM ---")
-    best_lgbm_params = _run_hyperparameter_search(X_train, y_train, X_val, y_val, 'lgbm')
-    
-    print("\n--- Running Hyperparameter Search for XGBoost ---")
-    best_xgb_params = _run_hyperparameter_search(X_train, y_train, X_val, y_val, 'xgb')
-
-    # --- Final Model Training ---
-    print("\n--- Training Final Models with Best Parameters ---")
-    class_weights = compute_class_weight('balanced', classes=np.unique(y_train_full), y=y_train_full)
-    sample_weights = y_train_full.map(dict(zip(np.unique(y_train_full), class_weights)))
-
-    lgbm_final = lgb.LGBMClassifier(**best_lgbm_params, objective='multiclass', num_class=3, random_state=42, n_jobs=-1)
-    lgbm_final.fit(X_train_full, y_train_full, sample_weight=sample_weights)
-
-    xgb_final = xgb.XGBClassifier(**best_xgb_params, objective='multi:softprob', num_class=3, random_state=42, n_jobs=-1)
-    xgb_final.fit(X_train_full, y_train_full, sample_weight=sample_weights)
-
-    # --- Probability Calibration (on the test set for simplicity here, could use another split) ---
-    print("\n--- Calibrating Models ---")
-    calibrated_lgbm = CalibratedClassifierCV(lgbm_final, method='isotonic', cv='prefit').fit(X_test, y_test)
-    calibrated_xgb = CalibratedClassifierCV(xgb_final, method='isotonic', cv='prefit').fit(X_test, y_test)
-
-    # --- Evaluation ---
-    print("\n--- Evaluating Models on Test Set ---")
-    evaluate_ensemble(calibrated_lgbm, calibrated_xgb, X_test, y_test)
-
-    # --- Persistence ---
+    best_val_accuracy = 0.0
+    model_path = os.path.join(MODELS_DIR, 'pytorch_lstm_model.pth')
     os.makedirs(MODELS_DIR, exist_ok=True)
-    model_path = os.path.join(MODELS_DIR, "trading_model_v2.joblib")
-    
-    model_artifact = {
-        'model_version': '2.0.0',
-        'training_timestamp_utc': datetime.utcnow().isoformat(),
-        'lgbm_model': calibrated_lgbm,
-        'xgb_model': calibrated_xgb,
-        'feature_columns': feature_columns,
-        'vol_thresholds': (features_df['volatility_50'].quantile(0.33), features_df['volatility_50'].quantile(0.67))
-    }
-    joblib.dump(model_artifact, model_path)
-    print(f"\nEnsemble model artifact saved to {model_path}")
 
-    # --- Post-Training Validation ---
-    plot_and_save_calibration_curve(model_artifact, X_test, y_test)
-    smoke_test_model_artifact(model_path, X_test.head(5))
-
-def evaluate_ensemble(lgbm_model, xgb_model, X_test, y_test):
-    """Evaluates the performance of each model and the ensemble."""
-    lgbm_proba = lgbm_model.predict_proba(X_test)
-    xgb_proba = xgb_model.predict_proba(X_test)
-    ensemble_proba = (lgbm_proba + xgb_proba) / 2
-    ensemble_pred = np.argmax(ensemble_proba, axis=1)
-
-    print("\n--- LGBM Classification Report ---")
-    print(classification_report(y_test, lgbm_model.predict(X_test), target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
-    
-    print("\n--- XGBoost Classification Report ---")
-    print(classification_report(y_test, xgb_model.predict(X_test), target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
-
-    print("\n--- Ensemble Classification Report ---")
-    print(classification_report(y_test, ensemble_pred, target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
-    print("\nEnsemble Confusion Matrix:")
-    print(confusion_matrix(y_test, ensemble_pred))
-
-def smoke_test_model_artifact(model_path, X_sample):
-    """Loads a saved model artifact and runs a quick prediction."""
-    print("\n--- Running Model Artifact Smoke Test ---")
-    try:
-        model_data = joblib.load(model_path)
-        lgbm = model_data['lgbm_model']
-        xgb = model_data['xgb_model']
+    for epoch in range(50):
+        model.train()
+        for seq_batch, static_batch, labels_batch in train_loader:
+            seq_batch, static_batch, labels_batch = seq_batch.to(DEVICE), static_batch.to(DEVICE), labels_batch.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(seq_batch, static_batch)
+            loss = criterion(outputs, labels_batch)
+            loss.backward()
+            optimizer.step()
         
-        lgbm_preds = lgbm.predict_proba(X_sample)
-        xgb_preds = xgb.predict_proba(X_sample)
-        
-        assert lgbm_preds.shape == (5, 3)
-        assert xgb_preds.shape == (5, 3)
-        print("Smoke test PASSED. Models loaded and predicted successfully.")
-    except Exception as e:
-        print(f"Smoke test FAILED: {e}")
-        raise
+        model.eval()
+        with torch.no_grad():
+            val_outputs = model(X_seq_val_t, X_static_val_t)
+            _, val_predicted = torch.max(val_outputs.data, 1)
+            val_accuracy = (val_predicted == y_val_t).sum().item() / y_val_t.size(0)
+            print(f'Epoch [{epoch+1}/50], Loss: {loss.item():.4f}, Validation Accuracy: {val_accuracy:.4f}')
+            
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                torch.save(model.state_dict(), model_path)
+                print(f"New best model saved to {model_path} with validation accuracy: {best_val_accuracy:.4f}")
 
-def plot_and_save_calibration_curve(model_artifact, X_test, y_test):
-    """Generates and saves calibration curves for the ensemble."""
-    print("\nGenerating calibration curves...")
-    fig, ax = plt.subplots(figsize=(12, 10))
+    print("\n--- Evaluating Best Model on Final Test Set ---")
+    best_model = LSTMModel(X_seq_train.shape[2], X_static_train.shape[1]).to(DEVICE)
+    best_model.load_state_dict(torch.load(model_path))
+    best_model.eval()
+    with torch.no_grad():
+        test_outputs = best_model(X_seq_test_t, X_static_test_t)
+        y_pred = torch.max(test_outputs, 1)[1].cpu().numpy()
+        
+    print("\nFinal Classification Report:")
+    print(classification_report(y_test, y_pred, target_names=['Loss', 'TP1', 'TP2'], zero_division=0))
     
-    models = {
-        "LGBM": model_artifact['lgbm_model'],
-        "XGBoost": model_artifact['xgb_model']
-    }
+    return best_model, X_seq_test_t, X_static_test_t, test_setups_df
+
+def run_backtest(model, test_sequences, test_static_features, test_setups_df, initial_balance=10000, risk_percent=2.0, confidence_threshold=0.4):
+    print("\n--- Running PyTorch Backtest ---")
+    model.eval()
+    with torch.no_grad():
+        outputs = model(test_sequences, test_static_features)
+        probabilities = torch.softmax(outputs, dim=1).cpu().numpy()
+        predicted_classes = np.argmax(probabilities, axis=1)
     
-    for model_name, model in models.items():
-        for i, class_name in enumerate(['Loss', 'TP1', 'TP2']):
-            CalibrationDisplay.from_estimator(
-                model, X_test, y_test, n_bins=10, class_to_plot=i,
-                name=f'{model_name} - {class_name}', ax=ax, strategy='uniform'
-            )
-    
-    ax.set_title("Calibration Curve for Each Model and Class")
+    equity_curve, trades_log = [initial_balance], []
+    balance = initial_balance
+    test_setups_df = test_setups_df.reset_index(drop=True)
+
+    for i in range(len(test_setups_df)):
+        confidence = probabilities[i].max()
+        if predicted_classes[i] in [1, 2] and confidence >= confidence_threshold:
+            true_label = test_setups_df.loc[i, 'label']
+            risk_amount = initial_balance * (risk_percent / 100.0) # Use initial_balance for stable risk
+            
+            pnl = 0
+            if true_label == 0: pnl = -risk_amount
+            elif true_label == 1: pnl = risk_amount
+            elif true_label == 2: pnl = risk_amount * 2
+            
+            balance += pnl
+            equity_curve.append(balance)
+            trades_log.append({'timestamp': test_setups_df.loc[i, 'timestamp'], 'pnl': pnl, 'balance': balance})
+            
+    print(f"Backtest complete. Executed {len(trades_log)} trades.")
+    if trades_log: print(f"Final Balance: ${equity_curve[-1]:,.2f}")
+    return equity_curve, pd.DataFrame(trades_log)
+
+def plot_backtest_results(equity_curve):
+    if len(equity_curve) <= 1: print("Not enough data to plot equity curve."); return
+    plt.figure(figsize=(12, 7))
+    plt.plot(equity_curve)
+    plt.title('PyTorch LSTM Model Backtest Equity Curve', fontsize=16)
+    plt.xlabel('Trade Number'); plt.ylabel('Portfolio Balance ($)')
     plt.grid(True)
-    plt.legend(loc="upper left")
-    
-    timestamp = model_artifact['training_timestamp_utc'].replace(':', '-')
-    plot_path = os.path.join(MODELS_DIR, f"calibration_curve_ensemble_{timestamp}.png")
-    plt.savefig(plot_path)
-    print(f"Calibration curves saved to {plot_path}")
+    chart_path = os.path.join(MODELS_DIR, 'pytorch_lstm_backtest_chart.png')
+    plt.savefig(chart_path)
+    print(f"Backtest chart saved to: {chart_path}")
     plt.close()
 
-
 def run_pipeline():
-    """
-    Runs the full data pipeline from acquisition to model training,
-    skipping steps if the data already exists.
-    """
-    features_path = os.path.join(PROCESSED_DATA_DIR, "features.parquet")
-    labeled_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
+    print("--- Starting Full PyTorch Model Pipeline ---")
+    print(f"Using device: {DEVICE}")
 
-    if os.path.exists(features_path):
-        print("--- Found existing features.parquet. Skipping to Step 4: Model Training ---")
-        train_model()
-    elif os.path.exists(labeled_path):
-        print("--- Found existing labeled_trades.parquet. Skipping to Step 3: Feature Engineering ---")
-        engineer_features()
-        print("\n--- Running Step 4: Model Training ---")
-        train_model()
+    raw_data_exists = os.path.exists(DATA_DIR) and len(glob.glob(os.path.join(DATA_DIR, '*', '*.parquet'))) > 0
+    if not raw_data_exists:
+        print("Raw data not found. Fetching initial historical data...")
+        fetch_initial_data(SESSIONS)
     else:
-        print("--- Running full pipeline from scratch ---")
-        print("--- Running Step 1: Data Acquisition ---")
-        fetch_initial_data()
+        print("Raw data directory found. Skipping initial fetch.")
+
+    labeled_data_path = os.path.join(PROCESSED_DATA_DIR, "labeled_trades.parquet")
+    if not os.path.exists(labeled_data_path):
+        print("Labeled data not found. Running preprocessing...")
+        main_preprocess(SESSIONS)
+    else:
+        print("Found existing labeled data, skipping preprocessing.")
         
-        print("\n--- Running Step 2: Preprocessing and Labeling ---")
-        main_preprocess()
-
-        print("\n--- Running Step 3: Feature Engineering ---")
-        engineer_features()
-
-        print("\n--- Running Step 4: Model Training ---")
-        train_model()
+    try:
+        labeled_df = pd.read_parquet(labeled_data_path)
+    except Exception as e:
+        print(f"Could not read labeled data file: {e}."); return
+        
+    labeled_df = labeled_df[labeled_df['label'] != -1].copy()
+    if labeled_df.empty: print("No valid labeled data found."); return
+    
+    sequences, static_features, labels = create_sequences_and_features(labeled_df)
+    if len(sequences) == 0: print("No sequences were generated."); return
+    
+    model, test_seq, test_static, test_setups = train_model(sequences, static_features, labels, labeled_df)
+    
+    equity_curve, trades_log = run_backtest(model, test_seq, test_static, test_setups)
+    
+    plot_backtest_results(equity_curve)
+    print("\n--- PyTorch Pipeline Finished ---")
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description="Run the ML pipeline for the trading bot.")
-    parser.add_argument(
-        'step', 
-        nargs='?', 
-        default='all', 
-        choices=['fetch', 'label', 'features', 'train', 'all'],
-        help="The pipeline step to run: 'fetch', 'label', 'features', 'train', or 'all' (default)."
-    )
-    args = parser.parse_args()
-
-    if args.step == 'all':
-        run_pipeline()
-    elif args.step == 'fetch':
-        fetch_initial_data()
-    elif args.step == 'label':
-        main_preprocess()
-    elif args.step == 'features':
-        engineer_features()
-    elif args.step == 'train':
-        train_model()
+    run_pipeline()
