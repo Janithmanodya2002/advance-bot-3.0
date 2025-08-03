@@ -186,8 +186,20 @@ def get_swing_points_df(df, window=5):
 
 def get_trend_df(swing_highs, swing_lows):
     if len(swing_highs) < 2 or len(swing_lows) < 2: return "undetermined"
-    if swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]: return "uptrend"
-    if swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2] and swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]: return "downtrend"
+    
+    is_higher_high = swing_highs['price'].iloc[-1] > swing_highs['price'].iloc[-2]
+    is_higher_low = swing_lows['price'].iloc[-1] > swing_lows['price'].iloc[-2]
+    is_lower_high = swing_highs['price'].iloc[-1] < swing_highs['price'].iloc[-2]
+    is_lower_low = swing_lows['price'].iloc[-1] < swing_lows['price'].iloc[-2]
+
+    # Uptrend: Must make a higher high, and the low must not be broken.
+    if is_higher_high and not is_lower_low:
+        return "uptrend"
+        
+    # Downtrend: Must make a lower low, and the high must not be broken.
+    if is_lower_low and not is_higher_high:
+        return "downtrend"
+        
     return "undetermined"
 
 def get_fib_retracement(p1, p2, trend):
@@ -219,7 +231,8 @@ def find_and_label_setups(df):
     # 1. Pre-calculate all swing points for the entire DataFrame at once
     all_swing_highs, all_swing_lows = get_swing_points_df(df, SWING_WINDOW)
 
-    for i in tqdm(range(LOOKBACK_CANDLES, len(df) - TRADE_EXPIRY_BARS), desc="Finding Setups"):
+    # Loop until there's enough space for lookback, entry search, and trade duration
+    for i in tqdm(range(LOOKBACK_CANDLES, len(df) - (2 * TRADE_EXPIRY_BARS)), desc="Finding Setups"):
         if df['session'].iloc[i] == 'Inactive':
             continue
             
@@ -239,14 +252,13 @@ def find_and_label_setups(df):
         
         if trend == 'downtrend':
             last_swing_high_price, last_swing_low_price = swing_highs.iloc[-1]['price'], swing_lows.iloc[-1]['price']
-            if last_swing_low_price >= swing_lows.iloc[-2]['price']: continue
             entry_price = get_fib_retracement(last_swing_high_price, last_swing_low_price, trend)
             sl = last_swing_high_price
             tp1 = entry_price - (sl - entry_price)
             tp2 = entry_price - (sl - entry_price) * 2
             
-            # Find entry candle
-            future_candles = df.iloc[i : i + TRADE_EXPIRY_BARS]
+            # Find entry candle (must occur AFTER the setup candle `i`)
+            future_candles = df.iloc[i + 1 : i + 1 + TRADE_EXPIRY_BARS]
             entry_mask = future_candles['high'] >= entry_price
             if not entry_mask.any(): continue
             entry_candle_idx = future_candles.index[entry_mask][0]
@@ -257,14 +269,13 @@ def find_and_label_setups(df):
 
         elif trend == 'uptrend':
             last_swing_high_price, last_swing_low_price = swing_highs.iloc[-1]['price'], swing_lows.iloc[-1]['price']
-            if last_swing_high_price <= swing_highs.iloc[-2]['price']: continue
             entry_price = get_fib_retracement(last_swing_low_price, last_swing_high_price, trend)
             sl = last_swing_low_price
             tp1 = entry_price + (entry_price - sl)
             tp2 = entry_price + (entry_price - sl) * 2
             
-            # Find entry candle
-            future_candles = df.iloc[i : i + TRADE_EXPIRY_BARS]
+            # Find entry candle (must occur AFTER the setup candle `i`)
+            future_candles = df.iloc[i + 1 : i + 1 + TRADE_EXPIRY_BARS]
             entry_mask = future_candles['low'] <= entry_price
             if not entry_mask.any(): continue
             entry_candle_idx = future_candles.index[entry_mask][0]
@@ -503,7 +514,7 @@ class EarlyStopping:
         self.counter = 0
         self.best_score = None
         self.early_stop = False
-        self.val_loss_min = np.Inf
+        self.val_loss_min = np.inf
         self.delta = delta
         self.path = path
         self.trace_func = trace_func
@@ -603,11 +614,22 @@ def train_model(sequences, static_features, labels, labeled_setups_df, loss_type
     train_dataset = TensorDataset(X_seq_train_t, X_static_train_t, y_train_t)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True) # Increased batch size
 
-    class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(DEVICE)
-    print(f"Using class weights: {class_weights}")
+    # --- Robust Class Weighting ---
+    num_classes = 3 # Define the total number of classes
+    unique_labels = np.unique(y_train)
+    class_weights_computed = compute_class_weight('balanced', classes=unique_labels, y=y_train)
+    
+    # Create a full weight tensor, initializing with 1.0 for all classes
+    full_class_weights = torch.ones(num_classes, dtype=torch.float32)
+    
+    # Map computed weights to their corresponding class index
+    for i, label in enumerate(unique_labels):
+        full_class_weights[label] = class_weights_computed[i]
+        
+    class_weights_tensor = full_class_weights.to(DEVICE)
+    print(f"Using class weights: {class_weights_tensor.cpu().numpy()}")
 
-    model = LSTMModel(X_seq_train.shape[2], X_static_train.shape[1]).to(DEVICE)
+    model = LSTMModel(X_seq_train.shape[2], X_static_train.shape[1], num_classes=num_classes).to(DEVICE)
     
     if loss_type == 'focal':
         print("Using Focal Loss")
@@ -617,7 +639,7 @@ def train_model(sequences, static_features, labels, labeled_setups_df, loss_type
         criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
         
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     
     model_path = os.path.join(MODELS_DIR, 'pytorch_lstm_model.pth')
     os.makedirs(MODELS_DIR, exist_ok=True)
