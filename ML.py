@@ -46,12 +46,13 @@ SESSIONS = {
 
 # --- Data Pipeline Functions ---
 
-def fetch_historical_for_symbol(symbol, client, total_limit=20000):
+def fetch_historical_for_symbol(symbol, total_limit=20000):
+    client = BinanceClient(keys.api_mainnet, keys.secret_mainnet)
     print(f"Fetching data for {symbol}...")
     all_klines = []
     limit = 1000
     # To prevent infinite loops for symbols with no data
-    max_attempts = 5
+    max_attempts = 25
     attempts = 0
     while len(all_klines) < total_limit and attempts < max_attempts:
         try:
@@ -82,12 +83,10 @@ def fetch_initial_data(sessions_dict, quick_test=False):
     else:
         total_limit = 20000
 
-    client = BinanceClient(keys.api_mainnet, keys.secret_mainnet)
-    
     # Using ProcessPoolExecutor to avoid GIL issues with CPU-bound processing later
     with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
         # Create a future for each symbol download
-        future_to_symbol = {executor.submit(fetch_historical_for_symbol, symbol, client, total_limit): symbol for symbol in symbols}
+        future_to_symbol = {executor.submit(fetch_historical_for_symbol, symbol, total_limit): symbol for symbol in symbols}
         
         for future in concurrent.futures.as_completed(future_to_symbol):
             symbol, klines = future.result()
@@ -759,55 +758,74 @@ def plot_backtest_results(equity_curve):
     print(f"Backtest chart saved to: {chart_path}")
     plt.close()
 
+import tempfile
+import shutil
+
 def run_pipeline(quick_test=False):
     print("--- Starting Full PyTorch Model Pipeline ---")
+    
+    global DATA_DIR, PROCESSED_DATA_DIR, MODELS_DIR
+    temp_dir = None
+
     if quick_test:
         print("--- RUNNING IN QUICK TEST MODE ---")
-    print(f"Using device: {DEVICE}")
+        temp_dir = tempfile.mkdtemp()
+        DATA_DIR = os.path.join(temp_dir, "data/raw")
+        PROCESSED_DATA_DIR = os.path.join(temp_dir, "data/processed")
+        MODELS_DIR = os.path.join(temp_dir, "models")
+        print(f"Using temporary directory: {temp_dir}")
 
-    # Check for raw data, fetch if needed
-    raw_data_exists = os.path.exists(DATA_DIR) and len(glob.glob(os.path.join(DATA_DIR, '*', '*.parquet'))) > 0
-    if not raw_data_exists:
-        print("Raw data not found. Fetching initial historical data...")
-        fetch_initial_data(SESSIONS, quick_test=quick_test)
-    else:
-        print("Raw data directory found. Skipping initial fetch.")
-
-    # Check for labeled data, preprocess if needed
-    labeled_data_filename = "labeled_trades_quick.parquet" if quick_test else "labeled_trades.parquet"
-    labeled_data_path = os.path.join(PROCESSED_DATA_DIR, labeled_data_filename)
-    if not os.path.exists(labeled_data_path):
-        print("Labeled data not found. Running preprocessing...")
-        main_preprocess(SESSIONS, quick_test=quick_test)
-    else:
-        print("Found existing labeled data, skipping preprocessing.")
-        
     try:
-        labeled_df = pd.read_parquet(labeled_data_path)
-    except Exception as e:
-        print(f"Could not read labeled data file: {e}. It might be empty if no setups were found."); return
+        print(f"Using device: {DEVICE}")
 
-    if labeled_df.empty:
-        print("No labeled setups were generated during preprocessing. Exiting.")
-        return
+        # Check for raw data, fetch if needed
+        raw_data_exists = os.path.exists(DATA_DIR) and len(glob.glob(os.path.join(DATA_DIR, '*', '*.parquet'))) > 0
+        if not raw_data_exists:
+            print("Raw data not found. Fetching initial historical data...")
+            fetch_initial_data(SESSIONS, quick_test=quick_test)
+        else:
+            print("Raw data directory found. Skipping initial fetch.")
 
-    labeled_df = labeled_df[labeled_df['label'] != -1].copy()
-    if labeled_df.empty:
-        print("No valid labeled setups found after filtering for label != -1. Exiting."); return
-    
-    sequences, static_features, labels = create_sequences_and_features(labeled_df)
-    if len(sequences) == 0:
-        print("No sequences were generated from the labeled data. Exiting."); return
-    
-    model, test_seq, test_static, test_setups = train_model(sequences, static_features, labels, labeled_df)
-    
-    equity_curve, trades_log = run_backtest(model, test_seq, test_static, test_setups)
-    
-    plot_backtest_results(equity_curve)
-    print("\n--- PyTorch Pipeline Finished ---")
+        # Check for labeled data, preprocess if needed
+        labeled_data_filename = "labeled_trades_quick.parquet" if quick_test else "labeled_trades.parquet"
+        labeled_data_path = os.path.join(PROCESSED_DATA_DIR, labeled_data_filename)
+        if not os.path.exists(labeled_data_path):
+            print("Labeled data not found. Running preprocessing...")
+            main_preprocess(SESSIONS, quick_test=quick_test)
+        else:
+            print("Found existing labeled data, skipping preprocessing.")
+        
+        try:
+            labeled_df = pd.read_parquet(labeled_data_path)
+        except Exception as e:
+            print(f"Could not read labeled data file: {e}. It might be empty if no setups were found."); return
+
+        if labeled_df.empty:
+            print("No labeled setups were generated during preprocessing. Exiting.")
+            return
+
+        labeled_df = labeled_df[labeled_df['label'] != -1].copy()
+        if labeled_df.empty:
+            print("No valid labeled setups found after filtering for label != -1. Exiting."); return
+        
+        sequences, static_features, labels, _ = create_sequences_and_features(labeled_df)
+        if len(sequences) == 0:
+            print("No sequences were generated from the labeled data. Exiting."); return
+        
+        model, test_seq, test_static, test_setups = train_model(sequences, static_features, labels, labeled_df)
+        
+        equity_curve, trades_log = run_backtest(model, test_seq, test_static, test_setups)
+        
+        plot_backtest_results(equity_curve)
+        print("\n--- PyTorch Pipeline Finished ---")
+    finally:
+        if temp_dir:
+            print(f"Cleaning up temporary directory: {temp_dir}")
+            shutil.rmtree(temp_dir)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the full ML pipeline.")
+    parser.add_argument('all', nargs='?', help='Dummy argument to accept "all"')
     parser.add_argument(
         '--quick-test',
         action='store_true',
