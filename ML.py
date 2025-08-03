@@ -1,4 +1,8 @@
+# For use in Google Colab, run this cell first to install dependencies
+# !pip install pandas numpy pyarrow python-binance matplotlib tqdm scikit-learn torch
+
 import os
+import sys
 import pandas as pd
 import numpy as np
 import pytz
@@ -27,10 +31,32 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # --- Configuration ---
-DATA_DIR = "data/raw"
-PROCESSED_DATA_DIR = "data/processed"
-MODELS_DIR = "models"
-SYMBOLS_FILE = "symbols.csv"
+# Check if running in Google Colab
+IN_COLAB = 'google.colab' in sys.modules
+
+if IN_COLAB:
+    from google.colab import drive
+    drive.mount('/content/drive')
+    
+    # Set up a root directory in your Google Drive
+    DRIVE_ROOT = '/content/drive/MyDrive/Colab_ML_Project'
+    DATA_DIR = os.path.join(DRIVE_ROOT, "data/raw")
+    PROCESSED_DATA_DIR = os.path.join(DRIVE_ROOT, "data/processed")
+    MODELS_DIR = os.path.join(DRIVE_ROOT, "models")
+    # Make sure the symbols file is placed in the root of your Drive project folder
+    SYMBOLS_FILE = os.path.join(DRIVE_ROOT, "symbols.csv")
+    
+    # Create directories if they don't exist
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+else:
+    DATA_DIR = "data/raw"
+    PROCESSED_DATA_DIR = "data/processed"
+    MODELS_DIR = "models"
+    SYMBOLS_FILE = "symbols.csv"
+
 SWING_WINDOW = 5
 LOOKBACK_CANDLES = 100
 TRADE_EXPIRY_BARS = 96
@@ -846,39 +872,59 @@ def run_pipeline(quick_test=False):
             shutil.rmtree(temp_dir)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Run the full ML pipeline.")
-    parser.add_argument('all', nargs='?', help='Dummy argument to accept "all"')
-    parser.add_argument(
-        '--quick-test',
-        action='store_true',
-        help='Run the pipeline with a small subset of data for testing purposes.'
-    )
-    parser.add_argument(
-        '--skip-pre-check',
-        action='store_true',
-        help='(For developers) Skip the mandatory quick test pre-check before a full run.'
-    )
-    args = parser.parse_args()
+    # --- Execution Guidance ---
+    # This script can be run from the command line or in a notebook like Google Colab.
 
-    if args.quick_test:
-        print("--- Running in Standalone Quick Test Mode ---")
-        run_pipeline(quick_test=True)
+    if IN_COLAB:
+        print("--- Script loaded in Google Colab ---")
+        print("To run the pipeline, call the `run_pipeline()` function in a new cell.")
+        print("\nExample for a quick test run:")
+        print("run_pipeline(quick_test=True)")
+        print("\nExample for a full run:")
+        print("# Make sure your data is in Google Drive first.")
+        print("# run_pipeline(quick_test=False)")
+
     else:
-        # This is a full run, which requires a pre-check first
-        pre_check_passed = False
-        if not args.skip_pre_check:
-            print("--- Running Mandatory Quick Test Pre-check ---")
-            try:
-                run_pipeline(quick_test=True)
-                print("\n--- Quick Test Pre-check PASSED ---\n")
-                pre_check_passed = True
-            except Exception as e:
-                print(f"\n--- Quick Test Pre-check FAILED: {e} ---\n")
-                print("Aborting full run due to pre-check failure.")
-        
-        if args.skip_pre_check or pre_check_passed:
-            if args.skip_pre_check:
-                print("--- Skipping Pre-check. Starting Full Run Directly ---")
-            else:
-                print("\n--- Starting Full Run ---")
-            run_pipeline(quick_test=False)
+        # Standard command-line execution
+        parser = argparse.ArgumentParser(description="Run the full ML pipeline.")
+        parser.add_argument(
+            '--quick-test',
+            action='store_true',
+            help='Run the pipeline with a small subset of data for testing purposes.'
+        )
+        parser.add_argument(
+            '--full-run',
+            action='store_true',
+            help='Run the full pipeline. A quick test pre-check will be run first.'
+        )
+        parser.add_argument(
+            '--skip-pre-check',
+            action='store_true',
+            help='(For developers) Skip the mandatory quick test pre-check before a full run.'
+        )
+        args = parser.parse_args()
+
+        if args.quick_test:
+            print("--- Running in Standalone Quick Test Mode ---")
+            run_pipeline(quick_test=True)
+        elif args.full_run:
+            pre_check_passed = False
+            if not args.skip_pre_check:
+                print("--- Running Mandatory Quick Test Pre-check ---")
+                try:
+                    run_pipeline(quick_test=True)
+                    print("\n--- Quick Test Pre-check PASSED ---\n")
+                    pre_check_passed = True
+                except Exception as e:
+                    print(f"\n--- Quick Test Pre-check FAILED: {e} ---\n")
+                    print("Aborting full run due to pre-check failure.")
+            
+            if args.skip_pre_check or pre_check_passed:
+                if args.skip_pre_check:
+                    print("--- Skipping Pre-check. Starting Full Run Directly ---")
+                else:
+                    print("\n--- Starting Full Run ---")
+                run_pipeline(quick_test=False)
+        else:
+            print("No run command specified. Use --quick-test or --full-run.")
+            parser.print_help()
